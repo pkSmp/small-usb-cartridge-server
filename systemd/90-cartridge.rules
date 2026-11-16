@@ -1,0 +1,3 @@
+# Cartridge volumes: any USB partition that carries config.json is imported
+# automatically. Volumes without config.json are ignored by the importer.
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_BUS}=="usb", ENV{ID_FS_TYPE}!="", TAG+="systemd", ENV{SYSTEMD_WANTS}+="cartridge-import@%k.service"

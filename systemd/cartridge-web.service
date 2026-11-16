@@ -1,0 +1,21 @@
+[Unit]
+Description=Cartridge web server (Rust)
+After=network.target local-fs.target cartridge-publish.service
+Wants=cartridge-publish.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cartridge web --root /run/cartridge --workers 2
+Restart=always
+RestartSec=1
+LimitNOFILE=65535
+# Keep the web tier alive before anything else when memory is tight.
+OOMScoreAdjust=-200
+# It only ever reads the RAM copy; it writes nothing but the pid file at start.
+ProtectSystem=strict
+ReadOnlyPaths=/run/cartridge /srv/cartridge
+ReadWritePaths=/run
+
+[Install]
+WantedBy=multi-user.target

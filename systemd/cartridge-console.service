@@ -1,0 +1,17 @@
+# /etc/systemd/system/cartridge-console.service
+[Unit]
+Description=Cartridge console - live USB and import report on tty1
+After=local-fs.target getty@tty1.service cartridge-boot-art.service
+Wants=getty@tty1.service
+# The art clears the screen, so the report must not start before it finishes.
+Wants=cartridge-boot-art.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cartridge console
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

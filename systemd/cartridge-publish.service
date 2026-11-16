@@ -1,0 +1,12 @@
+[Unit]
+Description=Publish the active cartridge release into RAM
+After=local-fs.target
+ConditionPathExists=/srv/cartridge
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cartridge publish
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=multi-user.target

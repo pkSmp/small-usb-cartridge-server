@@ -1,0 +1,18 @@
+[Unit]
+Description=Cartridge import for /dev/%I
+Documentation=file:/etc/cartridge/config.example.json
+After=local-fs.target
+ConditionPathExists=/dev/%I
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cartridge import /dev/%I
+TimeoutStartSec=45min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ProtectSystem=full
+ReadWritePaths=/var/lib/cartridge /var/log/cartridge /run /srv/cartridge
+ProtectHome=yes
+PrivateTmp=yes
