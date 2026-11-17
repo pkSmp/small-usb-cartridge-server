@@ -243,7 +243,8 @@ fn draw_status() {
         .unwrap_or_else(art_height);
     let h = heights;
 
-    let theme = crate::theme::Theme::load();
+    let theme = crate::theme::Theme::console();
+    theme.install();
     use crate::theme::Role;
     let stamp = theme.paint(Role::Dim, &sys::fmt_time("%H:%M:%S"));
     let usb = sys::usb_list();

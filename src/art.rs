@@ -155,6 +155,10 @@ impl FrameBuffer {
     }
 }
 
+pub fn apply_palette(pal: &[(u8, u8, u8); 16]) -> Result<(), String> {
+    set_palette(pal)
+}
+
 fn set_palette(pal: &[Rgb; 16]) -> Result<(), String> {
     let mut buf = [0u8; 48];
     for (i, c) in pal.iter().enumerate() {

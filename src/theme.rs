@@ -1,7 +1,8 @@
-//! Colours taken from the boot art. Small labels use the best visible art
-//! colour closest to bright red or light green; big text uses the brightest
-//! art colour closest to white. The console palette is the art palette, so a
-//! colour must be emitted through the slot that actually holds it.
+//! Colours taken from the boot art. Small labels use a reserved bright red on
+//! the console; if the art has no free slot, they fall back to the best visible
+//! saturated red or green. Big text uses the brightest art colour closest to
+//! white. The console palette is the art palette, so a colour must be emitted
+//! through the slot that actually holds it.
 
 use crate::json;
 use std::fs;
@@ -30,6 +31,9 @@ const DEFAULT_FG: [u8; 16] = [30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94
 const TEXT_TARGET: (u8, u8, u8) = (235, 235, 245);
 const TEXT_FALLBACK: (u8, u8, u8) = (232, 232, 248);
 const RED_FALLBACK: (u8, u8, u8) = (255, 96, 96);
+/// A real red for the console labels. The art often has only a dark crimson
+/// (this boot's #990030), which is too dim to read against black.
+const UI_RED: (u8, u8, u8) = (255, 0, 0);
 
 #[derive(Clone, Copy)]
 pub enum Role {
@@ -125,6 +129,24 @@ fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
 }
 
 impl Theme {
+    /// Load the console theme, reserving one unused art slot for a genuinely
+    /// bright red. The art itself keeps its own palette; only a slot the image
+    /// does not use is replaced.
+    pub fn console() -> Theme {
+        let mut theme = Theme::load();
+        if let Some(slot) = (10..16).find(|i| !visible(theme.palette[*i])) {
+            theme.palette[slot] = UI_RED;
+            theme.small = UI_RED;
+        }
+        theme
+    }
+
+    /// Apply this palette to the console tty. The console redraws through the
+    /// calibrated slot holding UI_RED, so the label colour is the real red.
+    pub fn install(&self) {
+        let _ = crate::art::apply_palette(&self.palette);
+    }
+
     pub fn load() -> Theme {
         let mut palette = ANSI;
         if let Ok(text) = fs::read_to_string("/var/lib/cartridge/art/map.json") {
