@@ -1,8 +1,10 @@
-//! Colours taken from the boot art. Small labels use a reserved bright red on
-//! the console; if the art has no free slot, they fall back to the best visible
-//! saturated red or green. Big text uses the brightest art colour closest to
-//! white. The console palette is the art palette, so a colour must be emitted
-//! through the slot that actually holds it.
+//! Colours taken entirely from the boot art. No palette slot is reserved for
+//! text: the image owns all 16 slots, and the console chooses existing image
+//! colours for its text. Small labels use the closest visible saturated red or
+//! green, preferring the brighter shade when two are equally close; big text
+//! uses the image colour closest to white. The console palette is the art
+//! palette, so a colour must be emitted through the slot that actually holds
+//! it.
 
 use crate::json;
 use std::fs;
@@ -28,12 +30,11 @@ const ANSI: [(u8, u8, u8); 16] = [
 
 const CALIB: &str = "/var/lib/cartridge/calib.json";
 const DEFAULT_FG: [u8; 16] = [30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97];
-const TEXT_TARGET: (u8, u8, u8) = (235, 235, 245);
+const TEXT_TARGET: (u8, u8, u8) = (255, 255, 255);
 const TEXT_FALLBACK: (u8, u8, u8) = (232, 232, 248);
 const RED_FALLBACK: (u8, u8, u8) = (255, 96, 96);
-/// A real red for the console labels. The art often has only a dark crimson
-/// (this boot's #990030), which is too dim to read against black.
-const UI_RED: (u8, u8, u8) = (255, 0, 0);
+const BRIGHT_RED: (u8, u8, u8) = (255, 0, 0);
+const BRIGHT_GREEN: (u8, u8, u8) = (0, 255, 0);
 
 #[derive(Clone, Copy)]
 pub enum Role {
@@ -84,15 +85,20 @@ fn saturated(c: (u8, u8, u8)) -> bool {
     max >= 64 && (max - min) * 100 / max >= 55
 }
 
-/// The brightest strongly-saturated red or green in the art. Choosing by
-/// saturation first avoids the pale beige/salmon that is closer in raw RGB
-/// distance but reads as beige on the terminal.
-fn best_small(palette: &[(u8, u8, u8); 16], keep: fn((u8, u8, u8)) -> bool) -> Option<(u8, u8, u8)> {
+/// The closest strongly-saturated red or green in the art. Saturation avoids
+/// the pale beige/salmon that is closer in raw RGB distance but reads as beige
+/// on the terminal. When two candidates are equally close, the brighter one
+/// wins; dim shades are the fallback, not the default.
+fn best_small(palette: &[(u8, u8, u8); 16]) -> Option<(u8, u8, u8)> {
     palette
         .iter()
         .copied()
-        .filter(|c| visible(*c) && saturated(*c) && keep(*c))
-        .max_by_key(|c| luminance(*c))
+        .filter(|c| visible(*c) && saturated(*c) && (is_red(*c) || is_green(*c)))
+        .min_by_key(|c| {
+            let target = dist(*c, BRIGHT_RED).min(dist(*c, BRIGHT_GREEN));
+            // Brighter shades sort first when distances tie.
+            (target, u32::MAX - luminance(*c))
+        })
 }
 
 fn nearest_light(
@@ -129,20 +135,14 @@ fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
 }
 
 impl Theme {
-    /// Load the console theme, reserving one unused art slot for a genuinely
-    /// bright red. The art itself keeps its own palette; only a slot the image
-    /// does not use is replaced.
+    /// Load the console theme without reserving a text colour. The image owns
+    /// every palette slot; text is painted with colours already in that image.
     pub fn console() -> Theme {
-        let mut theme = Theme::load();
-        if let Some(slot) = (10..16).find(|i| !visible(theme.palette[*i])) {
-            theme.palette[slot] = UI_RED;
-            theme.small = UI_RED;
-        }
-        theme
+        Theme::load()
     }
 
-    /// Apply this palette to the console tty. The console redraws through the
-    /// calibrated slot holding UI_RED, so the label colour is the real red.
+    /// Apply the image palette to the console tty. Every text colour is one of
+    /// these image colours, so no slot is replaced for the labels.
     pub fn install(&self) {
         let _ = crate::art::apply_palette(&self.palette);
     }
@@ -176,14 +176,13 @@ impl Theme {
             }
         }
 
-        // Small snippets: a genuinely saturated red or green from the image.
-        // Beige/salmon is rejected even when its RGB distance is smaller.
-        let small = best_small(&palette, is_red)
-            .or_else(|| best_small(&palette, is_green))
-            .unwrap_or(RED_FALLBACK);
+        // Small snippets: the closest saturated red or green in the image.
+        // Beige/salmon is rejected even when its RGB distance is smaller; the
+        // brighter shade wins only when two candidates are equally close.
+        let small = best_small(&palette).unwrap_or(RED_FALLBACK);
 
-        // Big text: the brightest image colour, but never the exact colour
-        // already chosen for the small snippets.
+        // Big text: the image colour closest to white, but never the exact
+        // colour already chosen for the small snippets.
         let text = nearest_light(&palette, TEXT_TARGET, 140, |_| true, Some(small))
             .unwrap_or(TEXT_FALLBACK);
         Theme { palette, fg, text, small }
