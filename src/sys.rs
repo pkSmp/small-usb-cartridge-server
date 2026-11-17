@@ -19,6 +19,20 @@ extern "C" {
     fn time(t: *mut i64) -> i64;
     fn localtime_r(t: *const i64, tm: *mut Tm) -> *mut Tm;
     fn utimensat(dirfd: c_int, path: *const c_char, times: *const Timespec, flags: c_int) -> c_int;
+    fn statvfs(path: *const c_char, buf: *mut StatVfs) -> c_int;
+}
+
+/// The first fields of Linux `struct statvfs` on 64-bit targets. The trailing
+/// space covers the fields this program does not read, so glibc can fill the
+/// whole structure without overrunning this buffer.
+#[repr(C)]
+struct StatVfs {
+    f_bsize: c_ulong,
+    f_frsize: c_ulong,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    _rest: [u8; 128],
 }
 
 const AT_FDCWD: c_int = -100;
@@ -352,6 +366,25 @@ pub fn apparent_kb(path: &Path) -> u64 {
         total = meta.len();
     }
     (total + 1023) / 1024
+}
+
+/// (filesystem total, used, available) in bytes for the filesystem holding
+/// `path`. Used includes the OS and every installed program, not just the
+/// cartridge's sites; this is the number to quote as storage use.
+pub fn filesystem_bytes(path: &str) -> Option<(u64, u64, u64)> {
+    let path = CString::new(path).ok()?;
+    let mut buf: StatVfs = unsafe { std::mem::zeroed() };
+    if unsafe { statvfs(path.as_ptr(), &mut buf) } != 0 {
+        return None;
+    }
+    let unit = if buf.f_frsize > 0 { buf.f_frsize } else { buf.f_bsize };
+    if unit == 0 {
+        return None;
+    }
+    let total = buf.f_blocks.saturating_mul(unit);
+    let used = buf.f_blocks.saturating_sub(buf.f_bfree).saturating_mul(unit);
+    let free = buf.f_bavail.saturating_mul(unit);
+    Some((total, used, free))
 }
 
 /// Disk usage in KiB, the plain `du -sk` value.

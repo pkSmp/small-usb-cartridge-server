@@ -27,7 +27,7 @@ serving. Web server, import, art, sound and status are all one
 | **Voice from the cartridge** | Every line is a WAV named after its sentence. The import maps config keys to those files and the player speaks them in order; a missing line is simply silent. |
 | **Audio never copied** | The clips stay on the stick, mounted read-only. The server keeps no WAV of its own; pulling the stick stops speech and clears the spoken text. |
 | **No wasted writes** | Files whose name and SHA-256 already match the running release are hard-linked into the new release instead of being written again. Replaying the same stick writes 0 bytes. |
-| **Live status screen** | Under the art: the Markdown site table, machine and staging facts, a pinned start test, and a "what it said" history that fills with the complete queued sentence immediately. Big text uses the brightest colour from the art; small labels use a saturated red or light green from the art. Storage counts internal disks and the internal live release only - removable media and the cartridge are never added. |
+| **Live status screen** | Under the art: the Markdown site table, machine and staging facts, a pinned start test, and a "what it said" history that fills with the complete queued sentence immediately. Big text uses the brightest colour from the art; small labels use a saturated red or light green from the art. Storage reports the internal filesystem's actual used and free space, so the OS, the server binary and every installed program are included; the removable cartridge is never counted. |
 
 ## Setup (5 minutes)
 
@@ -133,7 +133,7 @@ loadgen download HOST PORT PATH [CONNS]
   `aplay` exists only as a fallback. Jobs queue in a file and speak one at a time.
 - **Status.** Reads `/proc`, the release directory and the import log. The console
   draws the Markdown site table, machine facts and the spoken history; site sizes and
-  storage totals come from the internal live release, never the cartridge. Removing
+  storage totals come from the internal filesystem, including the OS and server, never the cartridge. Removing
   the stick clears the sound map, queue, history and stale mount.
 
 ## Commands

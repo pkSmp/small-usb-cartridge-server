@@ -198,6 +198,14 @@ fn dir_bytes(path: &Path) -> u64 {
     }
 }
 
+/// (storage total, used, left) in bytes for the internal filesystem. `used`
+/// includes the OS, this binary and the site release, not just the sites.
+pub fn storage() -> (u64, u64, u64) {
+    sys::filesystem_bytes("/")
+        .or_else(|| sys::filesystem_bytes("/srv/cartridge"))
+        .unwrap_or((0, 0, 0))
+}
+
 /// (all site bytes, bytes staged in RAM, bytes left on storage, sites)
 pub fn staging() -> (u64, u64, u64, u64) {
     if let Ok(text) = fs::read_to_string(USAGE) {
@@ -358,10 +366,15 @@ fn is_fragment(stem: &str) -> bool {
             | "gigabyte_of_sites_in_ram"
             | "megabytes_of_sites_in_ram"
             | "megabyte_of_sites_in_ram"
-            | "gigabytes_of_sites_on_disk"
-            | "gigabyte_of_sites_on_disk"
-            | "megabytes_of_sites_on_disk"
-            | "megabyte_of_sites_on_disk"
+            | "and"
+            | "gigabytes_of_storage_used"
+            | "gigabyte_of_storage_used"
+            | "megabytes_of_storage_used"
+            | "megabyte_of_storage_used"
+            | "gigabytes_of_storage_left"
+            | "gigabyte_of_storage_left"
+            | "megabytes_of_storage_left"
+            | "megabyte_of_storage_left"
     )
 }
 
@@ -416,7 +429,7 @@ pub fn job_text(paths: &[String]) -> String {
         } else if let Some(prev) = prev_fragment.as_deref() {
             if digit {
                 match prev {
-                    "out_of" => " ",
+                    "out_of" | "and" => " ",
                     "gigabytes" => ". ",
                     _ => ", ",
                 }
@@ -493,14 +506,16 @@ pub fn serve() -> Result<i32, String> {
 pub fn announce(full: bool) -> Result<usize, String> {
     let (drives, capacity) = hardware();
     let ram_total = mem_total_kb() * 1024;
-    let (total, ram, disk, _sites) = staging();
+    let (_total, ram, disk, _sites) = staging();
+    let (store_total, store_used, store_left) = storage();
+    let shown_total = if store_total > 0 { store_total } else { capacity };
 
     let mut seq: Vec<String> = Vec::new();
     if full {
         push(&mut seq, "BOOT");
         seq.extend(digits(drives));
         push(&mut seq, if drives == 1 { "UNIT-DRIVE" } else { "UNIT-DRIVES" });
-        seq.extend(digits(gb(capacity)));
+        seq.extend(digits(gb(shown_total)));
         push(&mut seq, "UNIT-GB-STORAGE");
         seq.extend(digits(gb(ram_total)));
         push(&mut seq, "UNIT-GB-RAM");
@@ -517,17 +532,25 @@ pub fn announce(full: bool) -> Result<usize, String> {
     push(&mut seq, "UNIT-OUT-OF");
     seq.extend(digits(gb(ram_total)));
     push(&mut seq, "UNIT-GB");
-    amount(
-        &mut seq,
-        total,
-        "UNIT-STORAGE-SITES",
-        "UNIT-STORAGE-SITE",
-        "UNIT-MB-STORAGE-SITES",
-        "UNIT-MB-STORAGE-SITE",
-    );
-    push(&mut seq, "UNIT-OUT-OF");
-    seq.extend(digits(gb(capacity)));
-    push(&mut seq, "UNIT-GB");
+    if store_total > 0 {
+        amount(
+            &mut seq,
+            store_used,
+            "UNIT-STORAGE-USED",
+            "UNIT-STORAGE-USED-ONE",
+            "UNIT-MB-STORAGE-USED",
+            "UNIT-MB-STORAGE-USED-ONE",
+        );
+        push(&mut seq, "UNIT-AND");
+        amount(
+            &mut seq,
+            store_left,
+            "UNIT-STORAGE-LEFT",
+            "UNIT-STORAGE-LEFT-ONE",
+            "UNIT-MB-STORAGE-LEFT",
+            "UNIT-MB-STORAGE-LEFT-ONE",
+        );
+    }
 
     if seq.is_empty() {
         return Err("no voice lines are installed".into());
@@ -547,10 +570,21 @@ pub fn summary() -> String {
     let (drives, capacity) = hardware();
     let ram_total = mem_total_kb() * 1024;
     let (total, ram, disk, _) = staging();
+    let (store_total, store_used, store_left) = storage();
+    let storage = if store_total > 0 {
+        format!(
+            "{} storage ({} used, {} left; OS and server included)",
+            sys::human(store_total),
+            sys::human(store_used),
+            sys::human(store_left)
+        )
+    } else {
+        format!("{} internal storage (usage unavailable)", sys::human(capacity))
+    };
     format!(
-        "{} internal drive(s), {} internal storage, {} RAM · sites {} ({} in RAM, {} on disk) · {} line(s) · {}",
+        "{} internal drive(s), {} · {} RAM · sites {} ({} in RAM, {} on disk) · {} line(s) · {}",
         drives,
-        sys::human(capacity),
+        storage,
         sys::human(ram_total),
         sys::human(total),
         sys::human(ram),

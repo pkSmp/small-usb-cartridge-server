@@ -552,11 +552,18 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
 
     // Limits are measured from the machine now: RAM is staged by publish, and
     // storage only has to hold the release with room to spare.
-    let free = free_kb("/srv/cartridge");
+    let (store_total, store_used, store_left) = crate::voice::storage();
+    let free = if store_total > 0 {
+        store_left / 1024
+    } else {
+        free_kb("/srv/cartridge")
+    };
     let need = total_kb + 131_072;
     log(&format!(
-        "storage: {} free internally, sites are {}; RAM staging is automatic",
+        "storage: {} used, {} left of {} (OS and server included); sites are {}; RAM staging is automatic",
+        if store_total > 0 { fmt_bytes(store_used) } else { "?".into() },
         fmt_bytes(free * 1024),
+        if store_total > 0 { fmt_bytes(store_total) } else { "?".into() },
         fmt_bytes(total_kb * 1024)
     ));
     if need > free {

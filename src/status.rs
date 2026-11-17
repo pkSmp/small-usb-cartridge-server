@@ -121,6 +121,7 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
     let cfg = config::load(&conf).unwrap_or_default();
     o.line(&format!("{} cartridge", o.p(Role::Ok, "*")));
     let (drives, capacity) = crate::voice::hardware();
+    let (store_total, store_used, store_left) = crate::voice::storage();
     o.kv(
         "machine",
         &format!(
@@ -129,6 +130,19 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
             sys::human(capacity),
             sys::human(crate::voice::mem_total_kb() * 1024)
         ),
+    );
+    o.kv(
+        "storage",
+        &if store_total > 0 {
+            format!(
+                "{} used, {} left of {} (OS and server included)",
+                sys::human(store_used),
+                sys::human(store_left),
+                sys::human(store_total)
+            )
+        } else {
+            o.p(Role::Warn, "usage unavailable")
+        },
     );
 
     // The live release is on the internal disk. Measure that, never the
