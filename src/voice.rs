@@ -1,12 +1,12 @@
 //! The voice: every clip is named after the sentence it speaks, so the file
 //! name is its own transcript. Callers only queue paths and return at once;
-//! `cartridge voice-serve` plays the queue in order, one line at a time, and
-//! types the transcript out while each line is spoken.
+//! the whole job is added to the transcript immediately, while
+//! `cartridge voice-serve` plays the queue in order.
 
 use crate::sound;
 use crate::sys;
 use std::fs;
-use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::thread;
@@ -23,9 +23,6 @@ pub const START: &str = "/run/cartridge-start-test.txt";
 pub const USAGE: &str = "/run/cartridge-usage.json";
 pub const QUEUE: &str = "/run/cartridge-voice.queue";
 pub const NOW: &str = "/run/cartridge-voice.now";
-/// Serialises whole jobs across processes, so two speakers never type their
-/// words into the same voice-log line.
-const TYPE_LOCK: &str = "/run/cartridge-voice.type.lock";
 pub const LOG: &str = "/var/log/cartridge/voice.log";
 const LIVE: &str = "/srv/cartridge/live";
 
@@ -222,13 +219,22 @@ fn mb(bytes: u64) -> u64 {
     (bytes + (1u64 << 20) - 1) / (1u64 << 20)
 }
 
-fn amount(seq: &mut Vec<String>, bytes: u64, big: &str, small: &str) {
+fn amount(
+    seq: &mut Vec<String>,
+    bytes: u64,
+    big: &str,
+    big_one: &str,
+    small: &str,
+    small_one: &str,
+) {
     if bytes >= 1 << 30 {
-        seq.extend(digits(gb(bytes)));
-        push(seq, big);
+        let n = gb(bytes);
+        seq.extend(digits(n));
+        push(seq, if n == 1 { big_one } else { big });
     } else {
-        seq.extend(digits(mb(bytes)));
-        push(seq, small);
+        let n = mb(bytes);
+        seq.extend(digits(n));
+        push(seq, if n == 1 { small_one } else { small });
     }
 }
 
@@ -245,9 +251,14 @@ fn unlock(file: &fs::File) {
 }
 
 /// Add a sequence to the queue and return immediately: nothing that speaks
-/// ever waits for the sound card.
+/// ever waits for the sound card. The complete sentence is logged now, not
+/// typed while the audio plays, so the console shows what is coming next.
 pub fn enqueue(paths: &[String]) -> Result<(), String> {
-    let paths: Vec<&String> = paths.iter().filter(|p| Path::new(p).is_file()).collect();
+    let paths: Vec<String> = paths
+        .iter()
+        .filter(|p| Path::new(p).is_file())
+        .cloned()
+        .collect();
     if paths.is_empty() {
         return Ok(());
     }
@@ -272,6 +283,9 @@ pub fn enqueue(paths: &[String]) -> Result<(), String> {
         file.flush().map_err(|e| e.to_string())
     })();
     unlock(&file);
+    if result.is_ok() {
+        log_job(&job_text(&paths));
+    }
     result
 }
 
@@ -329,6 +343,28 @@ fn is_digit(stem: &str) -> bool {
     stem.len() == 1 && stem.as_bytes()[0].is_ascii_digit()
 }
 
+/// Unit clips are fragments such as "drive" or "out of"; they belong inside
+/// a sentence, so they stay lowercase and do not get a full stop.
+fn is_fragment(stem: &str) -> bool {
+    matches!(
+        stem,
+        "drive"
+            | "drives"
+            | "gigabytes"
+            | "gigabytes_storage"
+            | "gigabytes_ram"
+            | "out_of"
+            | "gigabytes_of_sites_in_ram"
+            | "gigabyte_of_sites_in_ram"
+            | "megabytes_of_sites_in_ram"
+            | "megabyte_of_sites_in_ram"
+            | "gigabytes_of_sites_on_disk"
+            | "gigabyte_of_sites_on_disk"
+            | "megabytes_of_sites_on_disk"
+            | "megabyte_of_sites_on_disk"
+    )
+}
+
 /// The file name is the sentence: `the_computer_started_correctly.wav` reads
 /// back as "The computer started correctly."
 fn sentence(path: &str) -> String {
@@ -336,7 +372,22 @@ fn sentence(path: &str) -> String {
     if is_digit(&stem) {
         return stem;
     }
-    let mut words = stem.replace('_', " ");
+    let mut words = stem
+        .split('_')
+        .map(|word| match word {
+            "ram" => "RAM",
+            "usb" => "USB",
+            "ok" => "OK",
+            "gb" => "GB",
+            "mb" => "MB",
+            "url" => "URL",
+            _ => word,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if is_fragment(&stem) {
+        return words;
+    }
     if let Some(first) = words.chars().next() {
         words.replace_range(0..first.len_utf8(), &first.to_uppercase().to_string());
     }
@@ -346,114 +397,82 @@ fn sentence(path: &str) -> String {
     words
 }
 
-fn seconds(path: &str) -> f64 {
-    fs::metadata(path)
-        .map(|m| m.len().saturating_sub(44) as f64 / 176_400.0)
-        .unwrap_or(1.0)
-        .max(0.3)
-}
-
 /// The whole spoken sequence as one line. Numbers join with no space, because
 /// their files are single digits: `1.wav` + `2.wav` reads as `12`, while every
 /// other file is separated by a space.
 pub fn job_text(paths: &[String]) -> String {
     let mut out = String::new();
     let mut prev_digit = false;
+    let mut prev_fragment: Option<String> = None;
     for p in paths {
-        let digit = is_digit(&stem(p));
+        let stem = stem(p);
+        let digit = is_digit(&stem);
+        let fragment = is_fragment(&stem);
         let text = sentence(p);
-        if !out.is_empty() && !(digit && prev_digit) {
-            out.push(' ');
-        }
+        let separator = if out.is_empty() {
+            ""
+        } else if digit && prev_digit {
+            ""
+        } else if let Some(prev) = prev_fragment.as_deref() {
+            if digit {
+                match prev {
+                    "out_of" => " ",
+                    "gigabytes" => ". ",
+                    _ => ", ",
+                }
+            } else if fragment {
+                " "
+            } else {
+                ". "
+            }
+        } else {
+            " "
+        };
+        out.push_str(separator);
         out.push_str(&text);
         prev_digit = digit;
+        prev_fragment = if fragment { Some(stem) } else { None };
+    }
+    if !out.is_empty() && !out.ends_with('.') && !out.ends_with('?') && !out.ends_with('!') {
+        out.push('.');
     }
     out
 }
 
-/// Type one line out word by word at the speed it is spoken: on a terminal it
-/// appears right there, otherwise it is appended to the voice log, which the
-/// console keeps on screen as the "said" history.
-fn transcript(text: &str, total: f64) {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.is_empty() {
+/// Append the whole line to the spoken history. The console reads this log, so
+/// the text appears as soon as a job is queued rather than word by word.
+fn log_job(text: &str) {
+    if text.trim().is_empty() {
         return;
     }
-    let on_terminal = std::io::stdout().is_terminal()
-        || std::env::var("CARTRIDGE_TYPE_TTY").is_ok();
-    let delay = Duration::from_millis(
-        ((total * 1000.0) / words.len() as f64).clamp(30.0, 800.0) as u64,
-    );
-
-    if on_terminal {
-        let mut out = std::io::stdout();
-        let _ = out.write_all(b"  ");
-        for (i, word) in words.iter().enumerate() {
-            if i > 0 {
-                let _ = out.write_all(b" ");
-            }
-            if out.write_all(word.as_bytes()).is_err() {
-                return;
-            }
-            let _ = out.flush();
-            thread::sleep(delay);
-        }
-        let _ = out.write_all(b"\n");
-        let _ = out.flush();
-        return;
-    }
-
     let _ = fs::create_dir_all("/var/log/cartridge");
     let mut log = match fs::OpenOptions::new().create(true).append(true).open(LOG) {
         Ok(f) => f,
         Err(_) => return,
     };
     let stamp = format!("{}  ", sys::fmt_time("%H:%M:%S"));
-    if log.write_all(stamp.as_bytes()).is_err() {
-        return;
-    }
-    let _ = log.flush();
-    for (i, word) in words.iter().enumerate() {
-        let chunk = if i > 0 { format!(" {}", word) } else { word.to_string() };
-        if log.write_all(chunk.as_bytes()).is_err() {
-            return;
-        }
-        let _ = log.flush();
-        thread::sleep(delay);
-    }
-    let _ = log.write_all(b"\n");
+    let _ = log.write_all(format!("{}{}\n", stamp, text).as_bytes());
     let _ = log.flush();
 }
 
-/// Play a sequence here, typing the transcript as it goes. This is what
-/// `say --now` and the queue player both use.
-pub fn play_now(paths: &[String]) {
-    let type_lock = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(TYPE_LOCK)
-        .ok();
-    if let Some(f) = &type_lock {
-        let _ = lock_exclusive(f);
-    }
+/// Play a sequence here. Queued jobs were logged by `enqueue`; direct
+/// `say --now` calls log here so they also appear immediately.
+fn play(paths: &[String], log: bool) {
     let text = job_text(paths);
-    let total: f64 = paths.iter().map(|p| seconds(p)).sum();
     let _ = fs::write(NOW, format!("{}\n", text));
-    let typer = {
-        let text = text.clone();
-        thread::spawn(move || transcript(&text, total))
-    };
-    let result = sound::play_many(paths);
-    let _ = typer.join();
-    let _ = fs::write(NOW, "\n");
-    if let Some(f) = &type_lock {
-        unlock(f);
+    if log {
+        log_job(&text);
     }
+    let result = sound::play_many(paths);
+    let _ = fs::write(NOW, "\n");
     match result {
         Ok(how) => eprintln!("cartridge voice: {} line(s) via {}", paths.len(), how),
         Err(e) => eprintln!("cartridge voice: playback failed: {}", e),
     }
+}
+
+pub fn play_now(paths: &[String]) {
+    play(paths, true);
 }
 
 /// The player service: ever waiting, one line at a time, FIFO.
@@ -461,7 +480,7 @@ pub fn serve() -> Result<i32, String> {
     eprintln!("cartridge voice: waiting for lines in {}", QUEUE);
     loop {
         match pop_job() {
-            Some(paths) => play_now(&paths),
+            Some(paths) => play(&paths, false),
             None => thread::sleep(Duration::from_millis(150)),
         }
     }
@@ -487,11 +506,25 @@ pub fn announce(full: bool) -> Result<usize, String> {
         push(&mut seq, "UNIT-GB-RAM");
     }
     push(&mut seq, if disk == 0 { "ALL-FIT" } else { "NOT-ALL-FIT" });
-    amount(&mut seq, ram, "UNIT-RAM-SITES", "UNIT-MB-RAM-SITES");
+    amount(
+        &mut seq,
+        ram,
+        "UNIT-RAM-SITES",
+        "UNIT-RAM-SITE",
+        "UNIT-MB-RAM-SITES",
+        "UNIT-MB-RAM-SITE",
+    );
     push(&mut seq, "UNIT-OUT-OF");
     seq.extend(digits(gb(ram_total)));
     push(&mut seq, "UNIT-GB");
-    amount(&mut seq, total, "UNIT-STORAGE-SITES", "UNIT-MB-STORAGE-SITES");
+    amount(
+        &mut seq,
+        total,
+        "UNIT-STORAGE-SITES",
+        "UNIT-STORAGE-SITE",
+        "UNIT-MB-STORAGE-SITES",
+        "UNIT-MB-STORAGE-SITE",
+    );
     push(&mut seq, "UNIT-OUT-OF");
     seq.extend(digits(gb(capacity)));
     push(&mut seq, "UNIT-GB");

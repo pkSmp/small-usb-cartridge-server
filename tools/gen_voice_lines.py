@@ -1,177 +1,192 @@
-"""Generate the cartridge voice catalogue with edge-tts, as 16-bit stereo WAV.
+"""Generate the cartridge voice catalogue locally with XTTS v2.
 
-The server never runs a TTS engine: these files are the whole voice.  Each file
-is one short line, so the machine can queue them and play them back to back.
+Only the lines the server can actually queue are kept.  Synthesis runs entirely
+on the authoring machine; the server never runs TTS and never keeps a clip.
+The finished WAVs are written under ``usb/sounds/`` and are copied to the USB
+stick.  Output is 16-bit stereo 44.1 kHz WAV, trimmed and levelled for ALSA.
 
-Usage:  python tools/gen_voice_lines.py [name ...]
-        (no names = every line)
+Requirements (use a Python 3.12 virtual environment):
+  pip install coqui-tts torch torchaudio
+  ffmpeg on PATH
+
+The reference voice is a public-domain LibriVox/LibriTTS-R male recording at
+``_tts/ref/en-man.wav`` by default; override it with XTTS_REFERENCE.
+Generate into the USB staging tree with ``--usb-dir PATH``.
 """
 
+import argparse
+import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
-VOICE = "en-GB-SoniaNeural"
-RATE = "-3%"
-OUT = os.path.join("usb", "voice")
-
+# Every key the server can queue.  Unused catalogue entries are deliberately
+# absent, so old clips are removed instead of being regenerated.
 LINES = {
-    # digits, spoken one at a time so any number can be built
-    "n0": "0", "n1": "1", "n2": "2", "n3": "3", "n4": "4",
-    "n5": "5", "n6": "6", "n7": "7", "n8": "8", "n9": "9",
+    # boot report and units
+    "BOOT": "Boot OK.",
+    "UNIT-DRIVE": "drive",
+    "UNIT-DRIVES": "drives",
+    "UNIT-GB-STORAGE": "gigabytes storage",
+    "UNIT-GB-RAM": "gigabytes RAM",
+    "ALL-FIT": "All sites in RAM.",
+    "NOT-ALL-FIT": "Some sites on disk.",
+    "UNIT-RAM-SITES": "gigabytes of sites in RAM",
+    "UNIT-RAM-SITE": "gigabyte of sites in RAM",
+    "UNIT-MB-RAM-SITES": "megabytes of sites in RAM",
+    "UNIT-MB-RAM-SITE": "megabyte of sites in RAM",
+    "UNIT-OUT-OF": "out of",
+    "UNIT-GB": "gigabytes",
+    "UNIT-STORAGE-SITES": "gigabytes of sites on disk",
+    "UNIT-STORAGE-SITE": "gigabyte of sites on disk",
+    "UNIT-MB-STORAGE-SITES": "megabytes of sites on disk",
+    "UNIT-MB-STORAGE-SITE": "megabyte of sites on disk",
 
-    # units the digits hang off
-    "unit-drive": "drive",
-    "unit-drives": "drives",
-    "unit-gb": "gigabytes",
-    "unit-gb-storage": "gigabytes of storage",
-    "unit-gb-ram": "gigabytes of RAM",
-    "unit-mb": "megabytes",
-    "unit-files": "files",
-    "unit-seconds": "seconds",
-
-    # boot and power
-    "boot": "The computer started correctly.",
-    "ready": "The cartridge server is ready.",
-    "power-on": "Powering up.",
-    "power-off": "Shutting down. See you next time.",
-    "shutdown": "Shutting down.",
-    "reboot": "Rebooting.",
-    "goodbye": "Goodbye.",
-    "hello": "Hello.",
-    "standby": "Standby.",
-
-    # generic status words
-    "notice": "Attention.",
-    "warning": "Warning.",
-    "success": "Success.",
-    "failure": "Failure.",
-    "checking": "Checking.",
-    "loading": "Loading.",
-    "saving": "Saving.",
-    "starting": "Starting.",
-    "finished": "Finished.",
-    "wait": "Please wait.",
-    "almost-done": "Almost done.",
-    "online": "Online.",
-    "offline": "Offline.",
-    "network": "The network is connected.",
-    "no-network": "The network is not connected.",
-    "disk-ok": "There is plenty of space.",
-    "disk-full": "The disk is full.",
-    "memory-ok": "Memory is fine.",
-    "memory-low": "Memory is running low.",
-    "temperature": "The machine is warm.",
-    "fan": "The fan is running.",
-    "update": "Updating.",
-    "updated": "Updated.",
-
-    # cartridge in and out
-    "no-usb": "No cartridge is plugged in. The last sites are still running.",
-    "usb-found": "Cartridge detected. Reading it now.",
-    "usb-removed": "The cartridge was removed. The current sites are still running.",
-    "usb-safe": "It is safe to remove the cartridge.",
-
-    # checking and copying
-    "config-check": "Checking the cartridge settings.",
-    "config-ok": "The settings look good.",
-    "config-bad": "That settings file cannot be read.",
-    "missing-config": "This cartridge has no settings file.",
-    "files-check": "Checking the files.",
-    "sounds-ok": "The voice lines are ready.",
-    "sound-missing": "A voice line is missing. I will use the built-in sound.",
-    "copy-start": "Starting the copy.",
-    "copy-half": "Halfway through the copy.",
-    "copy-done": "The files are copied.",
-    "verify": "Checking every copied file.",
-    "verify-ok": "Every file checks out.",
-    "linking": "Unchanged files were linked, so nothing was copied twice.",
-    "new-files": "New files written.",
-    "no-change": "Nothing changed.",
-    "publish": "Switching the sites over.",
-    "publish-ok": "The sites are live.",
-    "done": "Import complete.",
-    "prune": "Old releases cleaned up.",
-
-    # boot art and the server
-    "art": "Drawing the boot screen.",
-    "art-ok": "The boot screen is ready.",
-    "server-start": "Starting the web server.",
-    "server-up": "The web server is running.",
-    "ports": "The sites are listening.",
-    "checking-ram": "Checking memory.",
-    "checking-storage": "Checking storage.",
-
-    # what fits where, and how much is in use
-    "all-fit": "All sites fit in RAM.",
-    "not-all-fit": "Not all sites fit in RAM. The rest stay on storage.",
-    "sites-stored": "Every site is stored on disk for the next boot.",
-    "unit-ram-sites": "gigabytes of RAM used for sites",
-    "unit-mb-ram-sites": "megabytes of RAM used for sites",
-    "unit-storage-sites": "gigabytes of storage used",
-    "unit-mb-storage-sites": "megabytes of storage used",
-    "unit-out-of": "out of",
-
-    # verdicts and refusals
-    "cartridge-ok": "The cartridge is good.",
-    "cartridge-bad": "The cartridge is not usable.",
-    "refused": "Cartridge refused.",
-    "error-config": "That cartridge has a broken settings file.",
-    "error-storage": "That cartridge does not fit in storage.",
-    "error-ram": "That cartridge does not fit in memory.",
-    "error-empty": "That cartridge has no sites on it.",
-    "error-copy": "The copy failed. The previous sites are still running.",
-    "error-device": "That is not a cartridge. I left it alone.",
-    "error-art": "The boot picture could not be drawn.",
-    "error-sound": "The sound card did not answer.",
+    # import milestones and errors
+    "CONFIG-OK": "Settings OK.",
+    "COPYING": "Copy in progress.",
+    "COPY-DONE": "Copy done.",
+    "PUBLISH": "Publishing.",
+    "PUBLISH-OK": "Sites live.",
+    "COMPLETE": "Done.",
+    "ERROR": "Cartridge refused.",
+    "ERROR-DEVICE": "Not a cartridge.",
+    "ERROR-CONFIG": "Bad settings.",
+    "ERROR-COPY": "Copy failed. Old sites live.",
+    "ERROR-EMPTY": "No sites.",
+    "ERROR-STORAGE": "Storage full.",
 }
 
-# One ffmpeg pass: trim the silence TTS leaves, even out the level, and add a
-# short lead-in so the first syllable is never clipped by the sound card.
+DIGIT_TEXT = ("zero", "one", "two", "three", "four",
+              "five", "six", "seven", "eight", "nine")
+for _n, _word in enumerate(DIGIT_TEXT):
+    LINES["DIGIT-%d" % _n] = _word
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def filename(key, text):
+    if key.startswith("DIGIT-"):
+        return key[-1] + ".wav"
+    return slug(text) + ".wav"
+
+
+def reference_wav():
+    here = os.path.dirname(os.path.abspath(__file__))
+    default = os.path.abspath(os.path.join(here, "..", "..", "_tts", "ref", "en-man.wav"))
+    return os.environ.get("XTTS_REFERENCE", default)
+
+
+def make_engine():
+    os.environ.setdefault("COQUI_TOS_AGREED", "1")
+    try:
+        from TTS.api import TTS
+    except Exception as exc:
+        raise SystemExit("XTTS is not installed in this Python: %s" % exc)
+    if not os.path.isfile(reference_wav()):
+        raise SystemExit("reference voice is missing: %s" % reference_wav())
+    return TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
+
+
+# Remove trailing silence, even the level, and add a short lead-in so the sound
+# card never clips the first syllable.  The voice itself is left untouched.
 AF = (
-    "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-45dB,"
+    "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-48dB,"
     "areverse,"
-    "silenceremove=start_periods=1:start_silence=0.12:start_threshold=-45dB,"
+    "silenceremove=start_periods=1:start_silence=0.12:start_threshold=-48dB,"
     "areverse,"
     "loudnorm=I=-16:TP=-1.5:LRA=11,"
     "adelay=40|40"
 )
 
 
-def make(name: str, text: str) -> int:
-    os.makedirs(OUT, exist_ok=True)
-    mp3 = os.path.join("_tts", name + ".mp3")
-    wav = os.path.join(OUT, name + ".wav")
-    os.makedirs("_tts", exist_ok=True)
-    subprocess.run(
-        [sys.executable, "-m", "edge_tts", "--voice", VOICE, "--rate=" + RATE,
-         "--text", text, "--write-media", mp3],
-        check=True, stdout=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", mp3, "-ar", "44100",
-         "-ac", "2", "-sample_fmt", "s16", "-af", AF, wav],
-        check=True,
-    )
-    return os.path.getsize(wav)
+def make_engine_file(tts, key, dest):
+    with tempfile.TemporaryDirectory(prefix="cartridge-tts-") as tmp:
+        raw = os.path.join(tmp, "raw.wav")
+        final = os.path.join(tmp, "final.wav")
+        tts.tts_to_file(
+            text=LINES[key],
+            speaker_wav=[reference_wav()],
+            language="en",
+            file_path=raw,
+            split_sentences=False,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", raw,
+             "-ar", "44100", "-ac", "2", "-sample_fmt", "s16",
+             "-af", AF, final],
+            check=True,
+        )
+        shutil.copyfile(final, dest)
+        return os.path.getsize(dest)
 
 
-def main() -> int:
-    force = "--force" in sys.argv
-    wanted = [a for a in sys.argv[1:] if a != "--force"] or list(LINES)
+def prune(sounds, expected):
+    removed = 0
+    for name in os.listdir(sounds):
+        if not name.lower().endswith(".wav"):
+            continue
+        if name not in expected:
+            os.remove(os.path.join(sounds, name))
+            removed += 1
+    return removed
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--usb-dir", default="usb")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--prune-only", action="store_true")
+    args = parser.parse_args()
+
+    usb = os.path.abspath(args.usb_dir)
+    sounds = os.path.join(usb, "sounds")
+    os.makedirs(sounds, exist_ok=True)
+
+    expected = {filename(key, text): key for key, text in LINES.items()}
+    removed = prune(sounds, expected)
+
+    # Also clean the old separate voice directory if this tree still has one.
+    old_voice = os.path.join(usb, "voice")
+    if os.path.isdir(old_voice):
+        for name in os.listdir(old_voice):
+            if name.lower().endswith(".wav"):
+                os.remove(os.path.join(old_voice, name))
+        try:
+            os.rmdir(old_voice)
+        except OSError:
+            pass
+
+    if args.prune_only:
+        print("removed %d unused clip(s)" % removed)
+        return 0
+
+    tts = make_engine()
+    made = 0
     total = 0
-    for i, name in enumerate(wanted, 1):
-        if name not in LINES:
-            print("skip unknown", name, file=sys.stderr)
+    for key in LINES:
+        name = filename(key, LINES[key])
+        dest = os.path.join(sounds, name)
+        if not args.force and os.path.isfile(dest) and os.path.getsize(dest) > 44:
+            total += os.path.getsize(dest)
             continue
-        wav = os.path.join(OUT, name + ".wav")
-        if not force and os.path.isfile(wav) and os.path.getsize(wav) > 44:
-            total += os.path.getsize(wav)
-            continue
-        size = make(name, LINES[name])
+        size = make_engine_file(tts, key, dest)
         total += size
-        print(f"[{i:>3}/{len(wanted)}] {name:18} {size:>8} B  {LINES[name]}")
-    print(f"{len(wanted)} line(s), {total} bytes")
+        made += 1
+        print("%-24s %7d B  %s" % (key, size, LINES[key]))
+
+    config = {"sounds": {key: filename(key, text) for key, text in LINES.items()}}
+    with open(os.path.join(usb, "config.json"), "w", encoding="utf-8") as out:
+        json.dump(config, out, indent=2)
+        out.write("\n")
+
+    print("removed %d unused, generated %d, total %d bytes, %d lines" %
+          (removed, made, total, len(LINES)))
     return 0
 
 

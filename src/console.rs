@@ -386,8 +386,15 @@ pub fn forget_dialogue() {
     let _ = fs::remove_file(crate::voice::START);
     let _ = fs::remove_dir_all("/var/lib/cartridge/sounds");
     let _ = fs::remove_dir_all("/var/lib/cartridge/voice");
-    for kind in ["complete", "failed", "copying"] {
-        let _ = fs::remove_file(format!("/var/lib/cartridge/current-{}.wav", kind));
+    // Older builds cached audio here as well; remove every format, not just
+    // WAV, so no sound survives on the server after the cartridge is pulled.
+    if let Ok(entries) = fs::read_dir("/var/lib/cartridge") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("current-") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
     let _ = sys::umount_lazy(crate::voice::MOUNT);
     let _ = std::process::Command::new("systemctl")

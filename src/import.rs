@@ -130,8 +130,15 @@ fn forget_stored_audio() {
     for dir in ["/var/lib/cartridge/sounds", "/var/lib/cartridge/voice"] {
         let _ = fs::remove_dir_all(dir);
     }
-    for kind in ["complete", "failed", "copying"] {
-        let _ = fs::remove_file(format!("{}/current-{}.wav", STATE, kind));
+    // Legacy builds also cached MP3s. Audio belongs on the cartridge only, so
+    // every cached current-* file goes, whatever its extension.
+    if let Ok(entries) = fs::read_dir(STATE) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("current-") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
@@ -353,7 +360,7 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
             release_device(mnt, true);
         }
         voice_line("ERROR-DEVICE");
-        play_sound(&crate::sound::builtin("failed"), "failed chime");
+        play_sound("", "failed chime");
         return Ok(0);
     }
     let config = match crate::config::load(&conf_path) {
@@ -364,7 +371,7 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
                 release_device(mnt, true);
             }
             voice_line("ERROR-CONFIG");
-            play_sound(&crate::sound::builtin("failed"), "failed chime");
+            play_sound("", "failed chime");
             return Ok(1);
         }
     };

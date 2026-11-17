@@ -1,65 +1,18 @@
-"""One catalogue for every spoken line: move all clips into usb/sounds/, write
-the Rust key table and a config.json that names each dialogue and its file.
+"""Write the Rust key table and USB config from the used-only voice list.
 
-Keys are the names the server and the cartridge config use, e.g. COPYING,
-COMPLETE, ERROR, DIGIT-7, UNIT-GB-RAM, ALL-FIT.
+The list lives in gen_voice_lines.py, so the catalogue, config and generated
+clips cannot drift apart.  Unused dialogue is not written at all.
 
-Usage: python tools/gen_catalog.py
+Usage: python tools/gen_catalog.py [--usb-dir PATH]
 """
 
+import argparse
 import json
 import os
-import re
-import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from gen_voice_lines import LINES  # noqa: E402
-
-ROOT = {
-    "copying": "Copying the cartridge now. This will only take a moment.",
-    "complete": "All done. Your sites are live.",
-    "error": "Sorry. That cartridge was refused. Nothing has changed, and the previous sites are still running.",
-}
-ROOT_KEYS = {"copying": "COPYING", "complete": "COMPLETE", "error": "ERROR"}
-
-SOUNDS = os.path.join("usb", "sounds")
-
-
-def slug(text):
-    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
-
-
-def key_of(name):
-    if re.fullmatch(r"n[0-9]", name):
-        return "DIGIT-" + name[1]
-    return name.upper().replace("_", "-")
-
-
-def collect():
-    entries = []
-    for name, text in ROOT.items():
-        entries.append((ROOT_KEYS[name], text, slug(text) + ".wav"))
-    for name, text in LINES.items():
-        entries.append((key_of(name), text, slug(text) + ".wav"))
-    return entries
-
-
-def move_files():
-    os.makedirs(SOUNDS, exist_ok=True)
-    moved = 0
-    voice = os.path.join("usb", "voice")
-    if os.path.isdir(voice):
-        for name in os.listdir(voice):
-            if name.endswith(".wav"):
-                os.replace(os.path.join(voice, name), os.path.join(SOUNDS, name))
-                moved += 1
-        os.rmdir(voice)
-    for name in os.listdir("usb"):
-        if name.endswith(".wav"):
-            os.replace(os.path.join("usb", name), os.path.join(SOUNDS, name))
-            moved += 1
-    return moved
+from gen_voice_lines import LINES, filename  # noqa: E402
 
 
 def write_catalog(entries):
@@ -75,29 +28,26 @@ def write_catalog(entries):
         lines.append('    ("{}", {}),'.format(key, json.dumps(text)))
     lines.append("];")
     lines.append("")
-    with open(os.path.join("cartridge", "src", "catalog.rs"), "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "src", "catalog.rs"), "w", encoding="utf-8") as out:
+        out.write("\n".join(lines))
 
 
-def write_config(entries):
+def write_config(entries, usb):
     sounds = {key: name for key, _, name in entries}
-    with open(os.path.join("usb", "config.json"), "w", encoding="utf-8") as f:
-        json.dump({"sounds": dict(sorted(sounds.items()))}, f, indent=2)
-        f.write("\n")
+    with open(os.path.join(usb, "config.json"), "w", encoding="utf-8") as out:
+        json.dump({"sounds": dict(sorted(sounds.items()))}, out, indent=2)
+        out.write("\n")
 
 
 def main():
-    entries = collect()
-    keys = [k for k, _, _ in entries]
-    dupes = {k for k in keys if keys.count(k) > 1}
-    if dupes:
-        print("duplicate keys:", sorted(dupes))
-        return 1
-    moved = move_files()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--usb-dir", default="usb")
+    args = parser.parse_args()
+    entries = [(key, text, filename(key, text)) for key, text in LINES.items()]
     write_catalog(entries)
-    write_config(entries)
-    print(f"{len(entries)} lines, {moved} clip(s) moved into usb/sounds/")
-    print("config keys:", ", ".join(keys[:8]), "…")
+    write_config(entries, os.path.abspath(args.usb_dir))
+    print("{} used line(s), catalog and config written".format(len(entries)))
     return 0
 
 
