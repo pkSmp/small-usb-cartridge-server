@@ -846,6 +846,9 @@ pub fn cmd_draw(art_path: &str) -> Result<i32, String> {
         }
     }
     set_palette(&pal)?;
+    // Start from a completely blank terminal. The image owns the rows it
+    // paints; old boot text below it must not survive as random strands.
+    write_tty(b"\x1b[0m\x1b[2J\x1b[H")?;
     let data = fs::read(art_path).map_err(|e| format!("cannot read {}: {}", art_path, e))?;
     write_tty(&data)?;
     println!(

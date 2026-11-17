@@ -1,6 +1,7 @@
 //! Colours taken from the boot art. Small labels use the best visible art
 //! colour closest to bright red or light green; big text uses the brightest
-//! art colour closest to white. Black and near-black are never selected.
+//! art colour closest to white. The console palette is the art palette, so a
+//! colour must be emitted through the slot that actually holds it.
 
 use crate::json;
 use std::fs;
@@ -24,13 +25,13 @@ const ANSI: [(u8, u8, u8); 16] = [
     (255, 255, 255),
 ];
 
+const CALIB: &str = "/var/lib/cartridge/calib.json";
+const DEFAULT_FG: [u8; 16] = [30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97];
 const TEXT_TARGET: (u8, u8, u8) = (235, 235, 245);
 const TEXT_FALLBACK: (u8, u8, u8) = (232, 232, 248);
 const RED_TARGET: (u8, u8, u8) = (255, 64, 64);
 const GREEN_TARGET: (u8, u8, u8) = (128, 255, 128);
 const RED_FALLBACK: (u8, u8, u8) = (255, 96, 96);
-const BRIGHT_RED: u8 = 9;
-const BRIGHT_GREEN: u8 = 10;
 
 #[derive(Clone, Copy)]
 pub enum Role {
@@ -44,9 +45,10 @@ pub enum Role {
 }
 
 pub struct Theme {
+    palette: [(u8, u8, u8); 16],
+    fg: [u8; 16],
     text: (u8, u8, u8),
     small: (u8, u8, u8),
-    small_ansi: u8,
 }
 
 fn luminance(c: (u8, u8, u8)) -> u32 {
@@ -94,6 +96,17 @@ fn nearest_light(
     best
 }
 
+fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
+    if s.len() != 7 || !s.starts_with('#') {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&s[1..3], 16).ok()?,
+        u8::from_str_radix(&s[3..5], 16).ok()?,
+        u8::from_str_radix(&s[5..7], 16).ok()?,
+    ))
+}
+
 impl Theme {
     pub fn load() -> Theme {
         let mut palette = ANSI;
@@ -101,12 +114,22 @@ impl Theme {
             if let Ok(v) = json::parse(&text) {
                 if let Some(arr) = v.get("palette").and_then(|p| p.as_arr()) {
                     for (i, item) in arr.iter().take(16).enumerate() {
-                        if let Some(s) = item.as_str() {
-                            if s.len() == 7 {
-                                let r = u8::from_str_radix(&s[1..3], 16).unwrap_or(0);
-                                let g = u8::from_str_radix(&s[3..5], 16).unwrap_or(0);
-                                let b = u8::from_str_radix(&s[5..7], 16).unwrap_or(0);
-                                palette[i] = (r, g, b);
+                        if let Some(c) = item.as_str().and_then(parse_hex) {
+                            palette[i] = c;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut fg = DEFAULT_FG;
+        if let Ok(text) = fs::read_to_string(CALIB) {
+            if let Ok(v) = json::parse(&text) {
+                if let Some(json::Value::Obj(items)) = v.get("fg") {
+                    for (key, val) in items {
+                        if let (Ok(slot), Some(code)) = (key.parse::<usize>(), val.as_i64()) {
+                            if slot < 16 {
+                                fg[slot] = code as u8;
                             }
                         }
                     }
@@ -118,42 +141,46 @@ impl Theme {
         // actually supplied. Dark/dim shades are excluded by the luma floor.
         let red = nearest_light(&palette, RED_TARGET, 100, is_red, None);
         let green = nearest_light(&palette, GREEN_TARGET, 100, is_green, None);
-        let (small, small_ansi) = match (red, green) {
+        let small = match (red, green) {
             (Some(r), Some(g)) => {
                 if dist(r, RED_TARGET) <= dist(g, GREEN_TARGET) {
-                    (r, BRIGHT_RED)
+                    r
                 } else {
-                    (g, BRIGHT_GREEN)
+                    g
                 }
             }
-            (Some(r), None) => (r, BRIGHT_RED),
-            (None, Some(g)) => (g, BRIGHT_GREEN),
-            (None, None) => (RED_FALLBACK, BRIGHT_RED),
+            (Some(r), None) => r,
+            (None, Some(g)) => g,
+            (None, None) => RED_FALLBACK,
         };
 
         // Big text: the brightest image colour, but never the exact colour
         // already chosen for the small snippets.
         let text = nearest_light(&palette, TEXT_TARGET, 140, |_| true, Some(small))
             .unwrap_or(TEXT_FALLBACK);
-        Theme { text, small, small_ansi }
+        Theme { palette, fg, text, small }
     }
 
-    /// Nearest console colour for big text, skipping black, dark red and dark
-    /// grey so text can never disappear into the background.
-    fn text_ansi(&self) -> u8 {
-        let mut best = 15u8;
+    /// Find the palette slot holding this colour and return the foreground
+    /// code calibrated for that slot. This is essential: the terminal palette
+    /// is the art palette, not the stock ANSI palette.
+    fn code_for(&self, colour: (u8, u8, u8)) -> u8 {
+        let mut best = None;
         let mut bestd = u32::MAX;
-        for (i, c) in ANSI.iter().enumerate() {
-            if matches!(i, 0 | 1 | 8) {
+        for (i, c) in self.palette.iter().enumerate() {
+            if !visible(*c) {
                 continue;
             }
-            let d = dist(*c, self.text);
+            let d = dist(*c, colour);
             if d < bestd {
                 bestd = d;
-                best = i as u8;
+                best = Some(i);
             }
         }
-        best
+        match best {
+            Some(i) => self.fg[i],
+            None => self.fg[7],
+        }
     }
 
     pub fn colour(&self, role: Role) -> (u8, u8, u8) {
@@ -164,19 +191,16 @@ impl Theme {
     }
 
     pub fn sgr(&self, role: Role) -> String {
-        let (idx, bold) = match role {
-            Role::Title => (self.text_ansi(), true),
-            Role::Text => (self.text_ansi(), false),
-            Role::Accent => (self.small_ansi, true),
-            Role::Dim => (self.small_ansi, false),
-            Role::Ok | Role::Warn | Role::Err => (self.small_ansi, true),
+        // No bold: bold changes which palette slot the console uses, and the
+        // unused bright slots in the art palette are black. Use the calibrated
+        // slot code directly so every text colour is visible.
+        let code = match role {
+            Role::Title | Role::Text => self.code_for(self.text),
+            Role::Accent | Role::Ok | Role::Warn | Role::Err | Role::Dim => {
+                self.code_for(self.small)
+            }
         };
-        let bold = if bold { "1;" } else { "" };
-        if idx < 8 {
-            format!("\x1b[{}{}m", bold, 30 + idx)
-        } else {
-            format!("\x1b[{}{}m", bold, 90 + idx - 8)
-        }
+        format!("\x1b[{}m", code)
     }
 
     pub fn paint(&self, role: Role, text: &str) -> String {
@@ -186,6 +210,6 @@ impl Theme {
     /// For a terminal that can mix colours: the exact hex from the art.
     pub fn truecolor(&self, role: Role) -> String {
         let c = self.colour(role);
-        format!("\x1b[1;38;2;{};{};{}m", c.0, c.1, c.2)
+        format!("\x1b[38;2;{};{};{}m", c.0, c.1, c.2)
     }
 }
