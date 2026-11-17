@@ -2,7 +2,9 @@
 //! new release, switch the live symlink, prune old releases, rebuild the boot
 //! art and play the chimes. Replaces cartridge-import.
 
+use crate::json::{self, Value};
 use crate::sys;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,6 +13,7 @@ const STORE: &str = "/srv/cartridge";
 const RELEASES: &str = "/srv/cartridge/releases";
 const LIVE: &str = "/srv/cartridge/live";
 const STATE: &str = "/var/lib/cartridge";
+const USB_MNT: &str = "/run/cartridge-usb";
 const LOG_FILE: &str = "/var/log/cartridge/import.log";
 const KEEP_RELEASES: usize = 2;
 
@@ -84,22 +87,115 @@ fn play_sound(file: &str, label: &str) {
     }
 }
 
-/// Cartridge audio has to be WAV now: the built-in chimes are WAV and the player
-/// is this binary, so an MP3 in the cartridge falls back to the built-in sound
-/// instead of pulling in an external decoder.
-fn pick_sound(mnt: &str, name: &str, kind: &str) -> String {
-    let p = Path::new(mnt).join(name);
-    if p.is_file() {
-        if name.to_ascii_lowercase().ends_with(".wav") {
-            return p.to_string_lossy().into_owned();
+/// A configured path is relative to the stick's `sounds/` folder. Absolute
+/// paths and `..` are refused, so a cartridge cannot point the server elsewhere.
+fn resolve_rel(rel: &str) -> Option<String> {
+    let rel = rel.trim();
+    let rel = rel.strip_prefix("./").unwrap_or(rel);
+    let rel = rel.strip_prefix("sounds/").unwrap_or(rel);
+    if rel.is_empty() || rel.starts_with('/') || rel.contains("..") {
+        return None;
+    }
+    Some(rel.to_string())
+}
+
+fn cartridge_sound(mnt: &str, rel: &str) -> Option<PathBuf> {
+    let clean = resolve_rel(rel)?;
+    let path = Path::new(mnt).join("sounds").join(clean);
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// The three milestone sounds play straight from the cartridge. Nothing is
+/// copied onto the server; a missing file is simply silent.
+fn pick_sound(mnt: &str, sounds: &BTreeMap<String, String>, key: &str, kind: &str) -> String {
+    if let Some(rel) = sounds.get(key) {
+        match cartridge_sound(mnt, rel) {
+            Some(src) if rel.to_ascii_lowercase().ends_with(".wav") => {
+                return src.to_string_lossy().into_owned();
+            }
+            _ => warn(&format!("{}: {} is missing from sounds/ - silent", key, rel)),
         }
+    }
+    let _ = kind;
+    String::new()
+}
+
+/// Strip every audio file the server may have accumulated: clips, the old
+/// voice folder and the copied milestone chimes. Audio lives on the stick only.
+fn forget_stored_audio() {
+    for dir in ["/var/lib/cartridge/sounds", "/var/lib/cartridge/voice"] {
+        let _ = fs::remove_dir_all(dir);
+    }
+    for kind in ["complete", "failed", "copying"] {
+        let _ = fs::remove_file(format!("{}/current-{}.wav", STATE, kind));
+    }
+}
+
+/// Resolve every configured dialogue once, straight into the read-only mount
+/// of the cartridge. A key without a file stays out of the map and is silent.
+fn write_sound_map(config: &crate::config::Config, mnt: &str) -> (usize, usize) {
+    let mut entries: Vec<(String, Value)> = Vec::new();
+    let mut missing = 0usize;
+    let mut names: Vec<String> = Vec::new();
+    for (key, rel) in &config.sounds {
+        if rel.is_empty() {
+            continue;
+        }
+        let stable = resolve_rel(rel).map(|clean| {
+            Path::new(USB_MNT)
+                .join("sounds")
+                .join(clean)
+                .to_string_lossy()
+                .into_owned()
+        });
+        match (cartridge_sound(mnt, rel), stable) {
+            (Some(_), Some(path)) => entries.push((key.clone(), Value::Str(path))),
+            _ => {
+                missing += 1;
+                if names.len() < 6 {
+                    names.push(key.clone());
+                }
+            }
+        }
+    }
+    if let Some(dir) = Path::new(crate::voice::MAP).parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(crate::voice::MAP, json::to_pretty(&Value::Obj(entries)));
+    if missing > 0 {
         warn(&format!(
-            "cartridge {} is {} - only WAV is played, using the built-in chime",
-            name,
-            name.rsplit('.').next().unwrap_or("?").to_ascii_uppercase()
+            "{} optional dialogue(s) have no file and stay silent: {}{}",
+            missing,
+            names.join(", "),
+            if missing > names.len() { " …" } else { "" }
         ));
     }
-    crate::sound::builtin(kind)
+    (config.sounds.len() - missing, missing)
+}
+
+/// Queue a line and move on: the voice service speaks it later, in order.
+fn voice_line(name: &str) {
+    if let Some(path) = crate::voice::file(name) {
+        match crate::voice::enqueue(&[path]) {
+            Ok(()) => ok(&format!("voice line {} queued", name)),
+            Err(e) => warn(&format!("voice line {} could not be queued: {}", name, e)),
+        }
+    }
+}
+
+fn free_kb(path: &str) -> u64 {
+    Command::new("df")
+        .args(["-B1", "--output=avail", path])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|t| t.lines().nth(1).and_then(|l| l.trim().parse::<u64>().ok()))
+        .map(|b| b / 1024)
+        .unwrap_or(u64::MAX)
 }
 
 fn release_device(mnt: &str, mounted: bool) {
@@ -109,7 +205,9 @@ fn release_device(mnt: &str, mounted: bool) {
             log(&format!("warning: could not unmount {}: {}", mnt, e));
         }
     }
-    let _ = fs::remove_dir(mnt);
+    if mnt != USB_MNT {
+        let _ = fs::remove_dir(mnt);
+    }
 }
 
 fn existing_mount(dev: &str) -> Option<String> {
@@ -221,6 +319,9 @@ pub fn run(dev: &str) -> Result<i32, String> {
         }
     };
 
+    // Import reads through its own short-lived mount. The console keeps the
+    // persistent read-only mount at USB_MNT, because this unit runs in a
+    // private mount namespace (PrivateTmp=yes) that would discard it.
     let mnt = free_name("/run/cartridge-import");
     let _ = fs::create_dir_all(&mnt);
     let mut mounted_here = false;
@@ -243,12 +344,16 @@ pub fn run(dev: &str) -> Result<i32, String> {
 }
 
 fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> {
+    forget_stored_audio();
+    log("audio stays on the cartridge; nothing is copied to this machine");
     let conf_path = Path::new(mnt).join("config.json");
     if !conf_path.is_file() {
         log(&format!("{} holds no config.json - not a cartridge, leaving it alone", dev));
         if mounted_here {
             release_device(mnt, true);
         }
+        voice_line("ERROR-DEVICE");
+        play_sound(&crate::sound::builtin("failed"), "failed chime");
         return Ok(0);
     }
     let config = match crate::config::load(&conf_path) {
@@ -258,15 +363,22 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
             if mounted_here {
                 release_device(mnt, true);
             }
-            play_sound(&format!("{}/current-failed.mp3", STATE), "failed chime");
+            voice_line("ERROR-CONFIG");
+            play_sound(&crate::sound::builtin("failed"), "failed chime");
             return Ok(1);
         }
     };
+    voice_line("CONFIG-OK");
 
     let _ = fs::create_dir_all(STATE);
-    crate::sound::ensure_builtin().unwrap_or_else(|e| warn(&e));
-    let complete_chime = pick_sound(mnt, &config.complete_sound, "complete");
-    let failed_chime = pick_sound(mnt, &config.failed_sound, "failed");
+    let complete_chime = pick_sound(mnt, &config.sounds, "COMPLETE", "complete");
+    let failed_chime = pick_sound(mnt, &config.sounds, "ERROR", "failed");
+    let copying_chime = pick_sound(mnt, &config.sounds, "COPYING", "copying");
+    let (mapped, unmapped) = write_sound_map(&config, mnt);
+    log(&format!(
+        "sounds: {} dialogue(s) playable, {} optional line(s) silent",
+        mapped, unmapped
+    ));
 
     // Only touch boot.png when the cartridge really carries a different image.
     let mut boot_png_new = false;
@@ -283,21 +395,15 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
         }
     }
 
-    let refuse = |reason: &str| -> Result<i32, String> {
+    let refuse = |reason: &str, event: &str| -> Result<i32, String> {
         err(&format!("refusing this cartridge: {}", reason));
         if mounted_here {
             release_device(mnt, true);
         }
+        voice_line(event);
         play_sound(&failed_chime, "failed chime");
         Ok(1)
     };
-
-    if config.ram_mb > config.storage_mb {
-        return refuse(&format!(
-            "ram_mb ({}) is larger than storage_mb ({})",
-            config.ram_mb, config.storage_mb
-        ));
-    }
 
     let _ = fs::create_dir_all(RELEASES);
     let staging = format!("{}/.staging.{}", RELEASES, std::process::id());
@@ -310,12 +416,14 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
         "README.txt".into(),
         "readme.txt".into(),
         "boot.png".into(),
-        config.complete_sound.clone(),
-        config.failed_sound.clone(),
+        "sounds".into(),
         "System Volume Information".into(),
         "$RECYCLE.BIN".into(),
         ".Trashes".into(),
     ];
+    // Say what is about to happen, then do it.
+    play_sound(&copying_chime, "copying message");
+
     let live_now = fs::read_link(LIVE).ok().map(|p| p.to_string_lossy().into_owned());
     match copy_dedup(
         Path::new(mnt),
@@ -333,17 +441,22 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
                 ));
             }
             log(&format!("{} file(s) written", written));
+            voice_line("COPY-DONE");
         }
         Err(e) => {
             let _ = fs::remove_dir_all(&staging);
-            return refuse(&format!("copy from {} failed: {}", dev, e));
+            return refuse(&format!("copy from {} failed: {}", dev, e), "ERROR-COPY");
         }
     }
 
     let mut sites = 0usize;
     let mut subtotal_kb = 0u64;
     let mut ports: Vec<String> = Vec::new();
+    // Sites as a Markdown table, so the log and the terminal match.
+    let mut table: Vec<[String; 3]> = Vec::new();
     log("websites found:");
+    log("| Port | Folder | Size |");
+    log("|-----:|:-------|-----:|");
     if let Ok(entries) = fs::read_dir(&staging) {
         let mut dirs: Vec<PathBuf> = entries
             .flatten()
@@ -358,22 +471,30 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
             }
             let kb = sys::disk_kb(&dir);
             subtotal_kb += kb;
-            log(&format!("  port {}  {}", name, fmt_bytes(kb * 1024)));
+            table.push([
+                format!("`{}`", name),
+                format!("`{}/`", name),
+                fmt_bytes(kb * 1024),
+            ]);
             ports.push(name);
             sites += 1;
         }
     }
     let total_kb = sys::disk_kb(Path::new(&staging));
     if Path::new(&staging).join("index.html").is_file() {
-        log(&format!(
-            "  port 80  {}  (index.html at the root)",
-            fmt_bytes(total_kb.saturating_sub(subtotal_kb) * 1024)
-        ));
+        table.push([
+            "`80`".into(),
+            "`/`".into(),
+            fmt_bytes(total_kb.saturating_sub(subtotal_kb) * 1024),
+        ]);
         ports.push("80".into());
         sites += 1;
     }
+    for row in &table {
+        log(&format!("| {} | {} | {} |", row[0], row[1], row[2]));
+    }
     log(&format!(
-        "  {} website(s), {} in total",
+        "{} website(s), {} in total",
         sites,
         fmt_bytes(total_kb * 1024)
     ));
@@ -393,17 +514,24 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
         }
     }
 
-    log("audio tracks:");
-    for (kind, name) in [
-        ("complete", config.complete_sound.clone()),
-        ("failed", config.failed_sound.clone()),
-    ] {
-        let p = Path::new(mnt).join(&name);
-        if p.is_file() {
-            let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            log(&format!("  {}: {}  found, {}", kind, name, fmt_bytes(size)));
-        } else {
-            log(&format!("  {}: {}  NOT FOUND", kind, name));
+    log(&format!(
+        "  sounds: {} dialogue(s) on the cartridge, none stored here",
+        crate::voice::count()
+    ));
+    log("milestones:");
+    for (kind, key) in [("copying", "COPYING"), ("complete", "COMPLETE"), ("error", "ERROR")] {
+        match config.sounds.get(key) {
+            Some(file) => {
+                let found = cartridge_sound(mnt, file).is_some();
+                log(&format!(
+                    "  {}: {} = {} ({})",
+                    kind,
+                    key,
+                    file,
+                    if found { "found" } else { "missing" }
+                ));
+            }
+            None => log(&format!("  {}: {} not set (silent)", kind, key)),
         }
     }
 
@@ -412,32 +540,34 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
         .unwrap_or(true);
     if empty {
         let _ = fs::remove_dir_all(&staging);
-        return refuse("the cartridge carries no site folders");
+        return refuse("the cartridge carries no site folders", "ERROR-EMPTY");
     }
 
-    let size_mb = (total_kb + 1023) / 1024;
+    // Limits are measured from the machine now: RAM is staged by publish, and
+    // storage only has to hold the release with room to spare.
+    let free = free_kb("/srv/cartridge");
+    let need = total_kb + 131_072;
     log(&format!(
-        "limits: storage {}MB, RAM {}MB; cartridge is {}MB",
-        config.storage_mb, config.ram_mb, size_mb
+        "storage: {} free, cartridge is {}; RAM staging is automatic",
+        fmt_bytes(free * 1024),
+        fmt_bytes(total_kb * 1024)
     ));
-    if size_mb > config.storage_mb {
+    if need > free {
         let _ = fs::remove_dir_all(&staging);
-        return refuse(&format!(
-            "website ({}MB) does not fit in storage ({}MB)",
-            size_mb, config.storage_mb
-        ));
-    }
-    if size_mb > config.ram_mb {
-        let _ = fs::remove_dir_all(&staging);
-        return refuse(&format!(
-            "website ({}MB) does not fit in RAM ({}MB)",
-            size_mb, config.ram_mb
-        ));
+        return refuse(
+            &format!(
+                "the sites need {} but only {} is free",
+                fmt_bytes(total_kb * 1024),
+                fmt_bytes(free * 1024)
+            ),
+            "ERROR-STORAGE",
+        );
     }
 
     fs::create_dir_all(Path::new(&staging).join(".cartridge")).map_err(|e| e.to_string())?;
     let _ = fs::copy(&conf_path, Path::new(&staging).join(".cartridge/config.json"));
     sys::sync();
+    voice_line("PUBLISH");
 
     let stamp = sys::fmt_time("%Y%m%d-%H%M%S");
     let release = format!("{}/{}", RELEASES, stamp);
@@ -448,6 +578,7 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
     let _ = fs::remove_file(LIVE);
     fs::rename(&live_new, LIVE).map_err(|e| e.to_string())?;
     ok(&format!("published release {}", stamp));
+    voice_line("PUBLISH-OK");
 
     let mut releases: Vec<String> = match fs::read_dir(RELEASES) {
         Ok(entries) => entries
@@ -463,10 +594,6 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
     for old in releases.iter().skip(KEEP_RELEASES) {
         log(&format!("pruning old release {}", old));
         let _ = fs::remove_dir_all(format!("{}/{}", RELEASES, old));
-    }
-
-    if mounted_here {
-        release_device(mnt, true);
     }
 
     if boot_png_new {
@@ -487,8 +614,12 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
 
     play_sound(&complete_chime, "complete chime");
     // Publish in-process instead of asking systemd for a restart.
-    if let Err(e) = crate::publish::run() {
-        log(&format!("warning: cartridge-publish did not run: {}", e));
+    match crate::publish::run() {
+        Ok(_) => match crate::voice::announce(false) {
+            Ok(n) => ok(&format!("usage announcement queued ({} lines)", n)),
+            Err(e) => warn(&format!("usage announcement skipped: {}", e)),
+        },
+        Err(e) => log(&format!("warning: cartridge-publish did not run: {}", e)),
     }
     ok("done");
     let _ = STORE;

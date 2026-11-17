@@ -54,6 +54,13 @@ impl Value {
         }
     }
 
+    pub fn as_obj(&self) -> Option<&Vec<(String, Value)>> {
+        match self {
+            Value::Obj(o) => Some(o),
+            _ => None,
+        }
+    }
+
     /// Dotted lookup for "sounds.complete" style keys.
     pub fn at(&self, dotted: &str) -> Option<&Value> {
         let mut node = self;

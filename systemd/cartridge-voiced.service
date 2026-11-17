@@ -1,0 +1,15 @@
+[Unit]
+Description=Cartridge voice player and transcript
+Documentation=file:/var/log/cartridge/voice.log
+After=local-fs.target sound.target
+Before=cartridge-boot-art.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cartridge voice-serve
+Restart=always
+RestartSec=2
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

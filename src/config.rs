@@ -1,32 +1,34 @@
-//! cartridge config.json: four settings, with the same defaults and the same
-//! tolerance for bad values as cartridge_config.py had.
+//! cartridge config.json: one `sounds` object naming every dialogue the user
+//! wants to hear, with the file inside the stick's `sounds/` folder.
+//!
+//!   {
+//!     "sounds": {
+//!       "BOOT": "the_computer_started_correctly.wav",
+//!       "DIGIT-7": "seven.wav",
+//!       "UNIT-GB-RAM": "gigabytes_of_ram.wav"
+//!     }
+//!   }
+//!
+//! Every key is optional: delete a line and that dialogue is skipped. Set a
+//! value to "" to silence one without deleting the key. Unknown keys are kept,
+//! so a cartridge can name extra lines and play them with `cartridge say`.
 
+use crate::catalog::LINES;
 use crate::json::{self, Value};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub struct Config {
-    pub complete_sound: String,
-    pub failed_sound: String,
-    pub storage_mb: u64,
-    pub ram_mb: u64,
+    pub sounds: BTreeMap<String, String>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config {
-            complete_sound: "complete.mp3".into(),
-            failed_sound: "failed.mp3".into(),
-            storage_mb: 2048,
-            ram_mb: 512,
+        let mut sounds = BTreeMap::new();
+        for (key, text) in LINES {
+            sounds.insert(key.to_string(), crate::voice::default_file_name(text));
         }
-    }
-}
-
-fn positive(value: Option<&Value>, fallback: u64) -> u64 {
-    match value {
-        Some(Value::Num(n)) if *n > 0.0 => *n as u64,
-        Some(Value::Str(s)) => s.trim().parse::<i64>().ok().filter(|n| *n > 0).map(|n| n as u64).unwrap_or(fallback),
-        _ => fallback,
+        Config { sounds }
     }
 }
 
@@ -38,19 +40,18 @@ pub fn load(path: &Path) -> Result<Config, String> {
         _ => return Err("config.json must contain a JSON object".into()),
     }
     let mut config = Config::default();
-    if let Some(sounds) = value.get("sounds") {
-        if let Some(s) = sounds.get("complete").and_then(|v| v.as_str()) {
-            if !s.is_empty() {
-                config.complete_sound = s.to_string();
-            }
-        }
-        if let Some(s) = sounds.get("failed").and_then(|v| v.as_str()) {
-            if !s.is_empty() {
-                config.failed_sound = s.to_string();
+    if let Some(Value::Obj(items)) = value.get("sounds") {
+        for (key, val) in items {
+            match val.as_str() {
+                Some("") => {
+                    config.sounds.remove(key);
+                }
+                Some(file) => {
+                    config.sounds.insert(key.clone(), file.trim().to_string());
+                }
+                None => {}
             }
         }
     }
-    config.storage_mb = positive(value.get("storage_mb"), 2048);
-    config.ram_mb = positive(value.get("ram_mb"), 512);
     Ok(config)
 }

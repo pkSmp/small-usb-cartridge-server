@@ -2,7 +2,7 @@
 Description=Cartridge boot art on the console
 # Draw once boot output has settled, otherwise later kernel/service messages
 # scroll the mosaic off the screen.
-After=local-fs.target systemd-vconsole-setup.service console-setup.service getty@tty1.service
+After=local-fs.target systemd-vconsole-setup.service console-setup.service getty@tty1.service cartridge-voiced.service
 Before=cartridge-console.service
 ConditionPathExists=/var/lib/cartridge/art/art.bin
 
@@ -10,7 +10,13 @@ ConditionPathExists=/var/lib/cartridge/art/art.bin
 Type=oneshot
 RemainAfterExit=yes
 ExecStartPre=/bin/sleep 3
+# A reboot starts with nothing said on screen; text is deliberately not saved.
+ExecStartPre=/bin/rm -f /var/log/cartridge/voice.log /var/lib/cartridge/start-test.txt
+# Mount the cartridge before the report, so the boot lines can play from it.
+ExecStartPre=/usr/local/bin/cartridge mount-usb
 ExecStart=/usr/local/bin/cartridge boot-art
+# Report what this machine has and where the sites were staged.
+ExecStartPost=-/usr/local/bin/cartridge announce
 StandardOutput=null
 TimeoutStartSec=120
 

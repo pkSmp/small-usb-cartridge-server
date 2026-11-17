@@ -9,9 +9,11 @@ use std::path::Path;
 
 const RATE: u32 = 44100;
 const DIR: &str = "/var/lib/cartridge/sounds";
+const VOICE_LOCK: &str = "/run/cartridge-voice.lock";
 
 extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
+    fn flock(fd: i32, operation: i32) -> i32;
 }
 
 fn wav_header(data_len: u32) -> Vec<u8> {
@@ -115,16 +117,36 @@ fn to_wav(samples: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Two soft rising blips, used when a cartridge carries no copying message.
+fn copying_samples() -> Vec<f32> {
+    let mut out = vec![0.0f32; (0.62 * RATE as f32) as usize];
+    for (freq, at, dur) in [(587.33f32, 0.0f32, 0.16f32), (880.0, 0.22, 0.34)] {
+        let start = (at * RATE as f32) as usize;
+        let n = (dur * RATE as f32) as usize;
+        for i in 0..n {
+            let t = i as f32 / RATE as f32;
+            let env = envelope(t, dur, 0.005, 6.0);
+            let phase = 2.0 * std::f32::consts::PI * freq * t;
+            let v = (phase.sin() + 0.25 * (2.0 * phase).sin()) * env * 0.45;
+            if start + i < out.len() {
+                out[start + i] += v;
+            }
+        }
+    }
+    out
+}
+
 pub fn ensure_builtin() -> Result<(), String> {
     fs::create_dir_all(DIR).map_err(|e| format!("sounds: {}", e))?;
-    let want = [
-        ("complete.wav", true),
-        ("failed.wav", false),
-    ];
-    for (name, ok) in want {
+    let want = ["complete.wav", "failed.wav", "copying.wav"];
+    for name in want {
         let path = format!("{}/{}", DIR, name);
         if !Path::new(&path).is_file() {
-            let samples = if ok { complete_samples() } else { failed_samples() };
+            let samples = match name {
+                "complete.wav" => complete_samples(),
+                "copying.wav" => copying_samples(),
+                _ => failed_samples(),
+            };
             fs::write(&path, to_wav(&samples))
                 .map_err(|e| format!("sounds: {}: {}", path, e))?;
         }
@@ -334,8 +356,52 @@ fn play_aplay(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// One line at a time: every caller takes this lock, so a boot announcement,
+/// an import and a manual `say` never talk over each other. The lock is held
+/// for the whole sequence, which is what queues them up.
+fn voice_lock() -> Option<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(VOICE_LOCK)
+        .ok()?;
+    use std::os::unix::io::AsRawFd;
+    if unsafe { flock(file.as_raw_fd(), 2) } == 0 {
+        Some(file)
+    } else {
+        None
+    }
+}
+
+/// Play a sequence back to back. Returns how the lines were played.
+pub fn play_many(paths: &[String]) -> Result<String, String> {
+    let _held = voice_lock();
+    let mut how = String::from("ALSA");
+    let mut played = 0usize;
+    let mut problem: Option<String> = None;
+    for path in paths {
+        match play_one(path) {
+            Ok(h) => {
+                how = h;
+                played += 1;
+            }
+            Err(e) => problem = Some(e),
+        }
+    }
+    if played > 0 {
+        Ok(how)
+    } else {
+        Err(problem.unwrap_or_else(|| "no voice line to play".into()))
+    }
+}
+
 /// Play one chime. Returns how it was played, for the log.
 pub fn play(path: &str) -> Result<String, String> {
+    play_many(&[path.to_string()])
+}
+
+fn play_one(path: &str) -> Result<String, String> {
     if !Path::new(path).is_file() {
         return Err(format!("{} is missing", path));
     }

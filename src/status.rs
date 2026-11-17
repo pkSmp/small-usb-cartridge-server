@@ -6,6 +6,7 @@ use crate::sys;
 use crate::theme::{Role, Theme};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const LOG: &str = "/var/log/cartridge/import.log";
 const LIVE: &str = "/srv/cartridge/live";
@@ -67,10 +68,6 @@ fn site_url(ip: &str, port: &str) -> String {
     }
 }
 
-fn sound_present(name: &str) -> bool {
-    Path::new(name).is_file()
-}
-
 fn audio_block(o: &Out) {
     o.head("audio");
     let cards = fs::read_to_string("/proc/asound/cards").unwrap_or_default();
@@ -95,21 +92,25 @@ fn audio_block(o: &Out) {
             }
         }
     }
-    let complete = crate::sound::builtin("complete");
-    let failed = crate::sound::builtin("failed");
-    let size = |p: &str| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    if sound_present(&complete) && sound_present(&failed) {
-        o.kv(
-            "chime",
-            &format!(
-                "{} complete · {} failed",
-                sys::human(size(&complete)),
-                sys::human(size(&failed))
-            ),
-        );
-    } else {
-        o.kv("chime", &o.p(Role::Warn, "not generated yet (run an import)"));
-    }
+    let lines = crate::voice::count();
+    let mounted = sys::is_mountpoint(crate::voice::MOUNT);
+    o.kv(
+        "sounds",
+        &if mounted {
+            format!(
+                "{} line(s) on the cartridge at {}",
+                lines,
+                crate::voice::MOUNT
+            )
+        } else {
+            o.p(
+                Role::Warn,
+                &format!("{} line(s) remembered; cartridge not inserted", lines),
+            )
+        },
+    );
+    o.kv("audio", "never copied to this machine");
+    o.kv("staging", &crate::voice::summary());
 }
 
 fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
@@ -117,16 +118,23 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
     if !conf.is_file() {
         return false;
     }
-    let config = config::load(&conf).unwrap_or_default();
+    let cfg = config::load(&conf).unwrap_or_default();
     o.line(&format!("{} cartridge", o.p(Role::Ok, "*")));
+    let (drives, capacity) = crate::voice::hardware();
     o.kv(
-        "limits",
-        &format!("storage {} MB · RAM {} MB", config.storage_mb, config.ram_mb),
+        "machine",
+        &format!(
+            "{} drive(s), {} storage, {} RAM (limits are automatic)",
+            drives,
+            sys::human(capacity),
+            sys::human(crate::voice::mem_total_kb() * 1024)
+        ),
     );
 
-    let mut ports: Vec<String> = Vec::new();
-    let mut subtotal = 0u64;
-    let mut sites = 0usize;
+        let mut sites = 0usize;
+    let mut rows: Vec<[String; 4]> = Vec::new();
+    let ip = sys::lan_ip();
+
     let mut dirs: Vec<PathBuf> = fs::read_dir(mount)
         .map(|it| it.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect())
         .unwrap_or_default();
@@ -136,49 +144,54 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        let kb = sys::apparent_kb(&dir);
-        subtotal += kb;
         sites += 1;
-        o.kv("site", &format!("port {:<6} {}", name, sys::human_kb(kb)));
-        ports.push(name);
+        rows.push([
+            format!("`{}`", name),
+            format!("`{}/`", name),
+            sys::human_kb(sys::apparent_kb(&dir)),
+            site_url(&ip, &name),
+        ]);
     }
     if mount.join("index.html").is_file() {
         sites += 1;
-        o.kv("site", "port 80     (index.html at the root)");
-        ports.push("80".into());
+        let size = fs::metadata(mount.join("index.html")).map(|m| m.len()).unwrap_or(0);
+        rows.push([
+            "`80`".into(),
+            "`/`".into(),
+            sys::human(size),
+            site_url(&ip, "80"),
+        ]);
     }
     o.kv(
         "total",
         &format!("{} website(s), {}", sites, sys::human_kb(sys::apparent_kb(mount))),
     );
-    if !ports.is_empty() {
-        let ip = sys::lan_ip();
-        for (i, port) in ports.iter().enumerate() {
-            let url = o.p(Role::Accent, &site_url(&ip, port));
-            if i == 0 {
-                o.kv("test", &url);
-            } else {
-                o.line(&format!("     {}", url));
-            }
-        }
+    if !rows.is_empty() {
+        site_table(o, &rows);
     }
 
-    for (label, name) in [("complete", &config.complete_sound), ("failed", &config.failed_sound)] {
-        let p = mount.join(name);
-        if p.is_file() {
-            let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            let supported = name.to_ascii_lowercase().ends_with(".wav");
-            o.kv(
-                label,
-                &format!(
-                    "{} {}{}",
-                    name,
-                    sys::human(size),
-                    if supported { "" } else { " - not WAV, the built-in chime is used" }
-                ),
-            );
-        } else {
-            o.kv(label, &o.p(Role::Dim, &format!("{} (built-in chime used)", name)));
+    o.kv(
+        "sounds",
+        &format!("{} dialogue(s) configured in sounds/", cfg.sounds.len()),
+    );
+    for (label, key) in [("copying", "COPYING"), ("complete", "COMPLETE"), ("error", "ERROR")] {
+        match cfg.sounds.get(key) {
+            Some(name) => {
+                let p = mount.join("sounds").join(name);
+                if p.is_file() {
+                    let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                    o.kv(label, &format!("`{}` {} {}", key, name, sys::human(size)));
+                } else {
+                    o.kv(
+                        label,
+                        &o.p(
+                            Role::Warn,
+                            &format!("`{}` {} missing (built-in chime)", key, name),
+                        ),
+                    );
+                }
+            }
+            None => o.kv(label, &o.p(Role::Dim, &format!("`{}` not set", key))),
         }
     }
 
@@ -193,15 +206,23 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
     }
 
     let total_kb = sys::apparent_kb(mount);
-    let total_mb = (total_kb + 1023) / 1024;
-    let verdict = if config.ram_mb > config.storage_mb {
-        format!("refuse: ram_mb > storage_mb")
-    } else if total_mb > config.storage_mb {
-        format!("refuse: {} MB > storage {} MB", total_mb, config.storage_mb)
-    } else if total_mb > config.ram_mb {
-        format!("refuse: {} MB > RAM {} MB", total_mb, config.ram_mb)
+    let free_kb = Command::new("df")
+        .args(["-B1", "--output=avail", "/srv/cartridge"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|t| t.lines().nth(1).and_then(|l| l.trim().parse::<u64>().ok()))
+        .map(|b| b / 1024)
+        .unwrap_or(u64::MAX);
+    // RAM never refuses: publish stages what fits and links the rest.
+    let verdict = if total_kb + 131_072 > free_kb {
+        format!(
+            "refuse: {} > {} free on storage",
+            sys::human_kb(total_kb),
+            sys::human_kb(free_kb)
+        )
     } else {
-        "accept".to_string()
+        "accept - RAM staging is automatic".to_string()
     };
     if verdict.starts_with("accept") {
         o.kv("verdict", &o.p(Role::Ok, &verdict));
@@ -209,6 +230,80 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
         o.kv("verdict", &o.p(Role::Err, &verdict));
     }
     true
+}
+
+/// Sites and their ports as a Markdown table: header, alignment row, then one
+/// padded row per site with backticked values.
+fn site_table(o: &Out, rows: &[[String; 4]]) {
+    let head = ["Port".to_string(), "Folder".to_string(), "Size".to_string(), "URL".to_string()];
+    let mut width = [head[0].len(), head[1].len(), head[2].len(), head[3].len()];
+    for row in rows {
+        for i in 0..4 {
+            width[i] = width[i].max(row[i].chars().count());
+        }
+    }
+    let cell = |row: &[String; 4]| -> String {
+        format!(
+            "| {:<w0$} | {:<w1$} | {:>w2$} | {:<w3$} |",
+            row[0], row[1], row[2], row[3],
+            w0 = width[0], w1 = width[1], w2 = width[2], w3 = width[3]
+        )
+    };
+    o.line(&cell(&head));
+    o.line(&format!(
+        "|:{}|:{}|{}:|:{}|",
+        "-".repeat(width[0] + 1),
+        "-".repeat(width[1] + 1),
+        "-".repeat(width[2] + 1),
+        "-".repeat(width[3] + 1)
+    ));
+    for row in rows {
+        o.line(&cell(row));
+    }
+}
+
+/// `cartridge sites`: the release that is live right now, as the same table.
+pub fn sites_cmd() -> Result<i32, String> {
+    let o = Out { t: Theme::load(), on: use_color() };
+    let live = Path::new(LIVE);
+    let ip = sys::lan_ip();
+    let mut rows: Vec<[String; 4]> = Vec::new();
+    if let Ok(entries) = fs::read_dir(live) {
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.path())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            rows.push([
+                format!("`{}`", name),
+                format!("`{}/`", name),
+                sys::human_kb(sys::disk_kb(&dir)),
+                site_url(&ip, &name),
+            ]);
+        }
+    }
+    if live.join("index.html").is_file() {
+        let size = fs::metadata(live.join("index.html")).map(|m| m.len()).unwrap_or(0);
+        rows.push([
+            "`80`".into(),
+            "`/`".into(),
+            sys::human(size),
+            site_url(&ip, "80"),
+        ]);
+    }
+    o.head("sites");
+    if rows.is_empty() {
+        o.kv("sites", &o.p(Role::Warn, "none published"));
+        return Ok(0);
+    }
+    site_table(&o, &rows);
+    Ok(0)
 }
 
 fn mount_target(dev: &str) -> Option<String> {

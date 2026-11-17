@@ -276,6 +276,17 @@ pub fn umount(target: &str) -> io::Result<()> {
     }
 }
 
+/// Detach a mount whose device is already gone (a pulled cartridge).
+pub fn umount_lazy(target: &str) -> io::Result<()> {
+    let tgt = CString::new(target).unwrap();
+    let rc = unsafe { umount2(tgt.as_ptr(), 2) }; // MNT_DETACH
+    if rc != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 pub fn try_lock(path: &str) -> Option<fs::File> {
     use std::os::unix::io::AsRawFd;
     let f = fs::OpenOptions::new().create(true).write(true).open(path).ok()?;

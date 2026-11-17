@@ -136,11 +136,11 @@ impl Theme {
     pub fn colour(&self, role: Role) -> (u8, u8, u8) {
         match role {
             Role::Title | Role::Accent => self.accent,
-            Role::Ok => self.nearest_entry((0, 170, 60)),
-            Role::Warn => self.nearest_entry((235, 165, 0)),
-            Role::Err => self.nearest_entry((210, 40, 40)),
-            Role::Dim => self.nearest_entry((120, 120, 130)),
-            Role::Text => (192, 192, 192),
+            Role::Ok => (0, 255, 80),
+            Role::Warn => (255, 210, 0),
+            Role::Err => (255, 70, 70),
+            Role::Dim => (200, 200, 210),
+            Role::Text => (255, 255, 255),
         }
     }
 
@@ -174,13 +174,16 @@ impl Theme {
     }
 
     pub fn sgr(&self, role: Role) -> String {
+        // Always the brightest console colour for a role. Art-derived colours
+        // kept coming out as dark reds and greys on this screen.
         let (idx, bold) = match role {
-            Role::Title | Role::Accent => (self.ansi_of(self.accent), true),
-            Role::Ok => (self.hued(125.0, 10), true),
-            Role::Warn => (self.hued(45.0, 11), true),
-            Role::Err => (self.hued(0.0, 9), true),
-            Role::Dim => (8, false),
-            Role::Text => (7, false),
+            Role::Title => (15, true),
+            Role::Accent => (14, true),
+            Role::Ok => (10, true),
+            Role::Warn => (11, true),
+            Role::Err => (9, true),
+            Role::Dim => (7, false),
+            Role::Text => (15, false),
         };
         let bold = if bold { "1;" } else { "" };
         if idx < 8 {
