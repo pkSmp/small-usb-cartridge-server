@@ -29,8 +29,6 @@ const CALIB: &str = "/var/lib/cartridge/calib.json";
 const DEFAULT_FG: [u8; 16] = [30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97];
 const TEXT_TARGET: (u8, u8, u8) = (235, 235, 245);
 const TEXT_FALLBACK: (u8, u8, u8) = (232, 232, 248);
-const RED_TARGET: (u8, u8, u8) = (255, 64, 64);
-const GREEN_TARGET: (u8, u8, u8) = (128, 255, 128);
 const RED_FALLBACK: (u8, u8, u8) = (255, 96, 96);
 
 #[derive(Clone, Copy)]
@@ -72,6 +70,25 @@ fn is_red(c: (u8, u8, u8)) -> bool {
 
 fn is_green(c: (u8, u8, u8)) -> bool {
     c.1 as u32 > c.0 as u32 + 8 && c.1 as u32 > c.2 as u32 + 8
+}
+
+/// Beige and brown are technically reddish, but they are not the red the
+/// labels need. Require a genuinely saturated colour before it can be chosen.
+fn saturated(c: (u8, u8, u8)) -> bool {
+    let max = c.0.max(c.1).max(c.2) as u32;
+    let min = c.0.min(c.1).min(c.2) as u32;
+    max >= 64 && (max - min) * 100 / max >= 55
+}
+
+/// The brightest strongly-saturated red or green in the art. Choosing by
+/// saturation first avoids the pale beige/salmon that is closer in raw RGB
+/// distance but reads as beige on the terminal.
+fn best_small(palette: &[(u8, u8, u8); 16], keep: fn((u8, u8, u8)) -> bool) -> Option<(u8, u8, u8)> {
+    palette
+        .iter()
+        .copied()
+        .filter(|c| visible(*c) && saturated(*c) && keep(*c))
+        .max_by_key(|c| luminance(*c))
 }
 
 fn nearest_light(
@@ -137,22 +154,11 @@ impl Theme {
             }
         }
 
-        // Small snippets: the closest bright red or light green the image
-        // actually supplied. Dark/dim shades are excluded by the luma floor.
-        let red = nearest_light(&palette, RED_TARGET, 100, is_red, None);
-        let green = nearest_light(&palette, GREEN_TARGET, 100, is_green, None);
-        let small = match (red, green) {
-            (Some(r), Some(g)) => {
-                if dist(r, RED_TARGET) <= dist(g, GREEN_TARGET) {
-                    r
-                } else {
-                    g
-                }
-            }
-            (Some(r), None) => r,
-            (None, Some(g)) => g,
-            (None, None) => RED_FALLBACK,
-        };
+        // Small snippets: a genuinely saturated red or green from the image.
+        // Beige/salmon is rejected even when its RGB distance is smaller.
+        let small = best_small(&palette, is_red)
+            .or_else(|| best_small(&palette, is_green))
+            .unwrap_or(RED_FALLBACK);
 
         // Big text: the brightest image colour, but never the exact colour
         // already chosen for the small snippets.
