@@ -1,7 +1,6 @@
-//! Colours taken from the boot art. The console only has sixteen colours, so
-//! each role picks the palette entry that is closest to what the role means
-//! (green for success, red for refusal, ...) and then the nearest console
-//! colour to that entry.
+//! Colours taken from the boot art. Small labels use the best visible art
+//! colour closest to bright red or light green; big text uses the brightest
+//! art colour closest to white. Black and near-black are never selected.
 
 use crate::json;
 use std::fs;
@@ -25,6 +24,14 @@ const ANSI: [(u8, u8, u8); 16] = [
     (255, 255, 255),
 ];
 
+const TEXT_TARGET: (u8, u8, u8) = (235, 235, 245);
+const TEXT_FALLBACK: (u8, u8, u8) = (232, 232, 248);
+const RED_TARGET: (u8, u8, u8) = (255, 64, 64);
+const GREEN_TARGET: (u8, u8, u8) = (128, 255, 128);
+const RED_FALLBACK: (u8, u8, u8) = (255, 96, 96);
+const BRIGHT_RED: u8 = 9;
+const BRIGHT_GREEN: u8 = 10;
+
 #[derive(Clone, Copy)]
 pub enum Role {
     Title,
@@ -37,29 +44,13 @@ pub enum Role {
 }
 
 pub struct Theme {
-    palette: [(u8, u8, u8); 16],
-    accent: (u8, u8, u8),
+    text: (u8, u8, u8),
+    small: (u8, u8, u8),
+    small_ansi: u8,
 }
 
-/// Hue in degrees and saturation, or (-1, 0) for greys.
-fn hue_sat(c: (u8, u8, u8)) -> (f32, f32) {
-    let r = c.0 as f32 / 255.0;
-    let g = c.1 as f32 / 255.0;
-    let b = c.2 as f32 / 255.0;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let d = max - min;
-    if max <= 0.001 || d / max < 0.08 {
-        return (-1.0, 0.0);
-    }
-    let h = if max == r {
-        ((g - b) / d) % 6.0
-    } else if max == g {
-        (b - r) / d + 2.0
-    } else {
-        (r - g) / d + 4.0
-    };
-    (((h * 60.0) + 360.0) % 360.0, d / max)
+fn luminance(c: (u8, u8, u8)) -> u32 {
+    299 * c.0 as u32 + 587 * c.1 as u32 + 114 * c.2 as u32
 }
 
 fn dist(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
@@ -69,10 +60,43 @@ fn dist(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
     (dr * dr + dg * dg + db * db) as u32
 }
 
+fn visible(c: (u8, u8, u8)) -> bool {
+    c.0.max(c.1).max(c.2) > 24 && luminance(c) > 32
+}
+
+fn is_red(c: (u8, u8, u8)) -> bool {
+    c.0 as u32 > c.1 as u32 + 8 && c.0 as u32 > c.2 as u32 + 8
+}
+
+fn is_green(c: (u8, u8, u8)) -> bool {
+    c.1 as u32 > c.0 as u32 + 8 && c.1 as u32 > c.2 as u32 + 8
+}
+
+fn nearest_light(
+    palette: &[(u8, u8, u8); 16],
+    target: (u8, u8, u8),
+    min_luma: u32,
+    keep: fn((u8, u8, u8)) -> bool,
+    skip: Option<(u8, u8, u8)>,
+) -> Option<(u8, u8, u8)> {
+    let mut best = None;
+    let mut bestd = u32::MAX;
+    for c in palette.iter().copied() {
+        if !visible(c) || luminance(c) < min_luma || !keep(c) || Some(c) == skip {
+            continue;
+        }
+        let d = dist(c, target);
+        if d < bestd {
+            bestd = d;
+            best = Some(c);
+        }
+    }
+    best
+}
+
 impl Theme {
     pub fn load() -> Theme {
         let mut palette = ANSI;
-        let mut ok = false;
         if let Ok(text) = fs::read_to_string("/var/lib/cartridge/art/map.json") {
             if let Ok(v) = json::parse(&text) {
                 if let Some(arr) = v.get("palette").and_then(|p| p.as_arr()) {
@@ -83,48 +107,47 @@ impl Theme {
                                 let g = u8::from_str_radix(&s[3..5], 16).unwrap_or(0);
                                 let b = u8::from_str_radix(&s[5..7], 16).unwrap_or(0);
                                 palette[i] = (r, g, b);
-                                ok = true;
                             }
                         }
                     }
                 }
             }
         }
-        let _ = ok;
-        // The accent is the most saturated colour in the art, which is what the
-        // eye already associates with "this machine".
-        let mut accent = (192, 192, 192);
-        let mut best = 0i32;
-        for c in palette.iter() {
-            let max = c.0.max(c.1).max(c.2) as i32;
-            let min = c.0.min(c.1).min(c.2) as i32;
-            let chroma = max - min + max / 8;
-            if chroma > best {
-                best = chroma;
-                accent = *c;
+
+        // Small snippets: the closest bright red or light green the image
+        // actually supplied. Dark/dim shades are excluded by the luma floor.
+        let red = nearest_light(&palette, RED_TARGET, 100, is_red, None);
+        let green = nearest_light(&palette, GREEN_TARGET, 100, is_green, None);
+        let (small, small_ansi) = match (red, green) {
+            (Some(r), Some(g)) => {
+                if dist(r, RED_TARGET) <= dist(g, GREEN_TARGET) {
+                    (r, BRIGHT_RED)
+                } else {
+                    (g, BRIGHT_GREEN)
+                }
             }
-        }
-        Theme { palette, accent }
+            (Some(r), None) => (r, BRIGHT_RED),
+            (None, Some(g)) => (g, BRIGHT_GREEN),
+            (None, None) => (RED_FALLBACK, BRIGHT_RED),
+        };
+
+        // Big text: the brightest image colour, but never the exact colour
+        // already chosen for the small snippets.
+        let text = nearest_light(&palette, TEXT_TARGET, 140, |_| true, Some(small))
+            .unwrap_or(TEXT_FALLBACK);
+        Theme { text, small, small_ansi }
     }
 
-    fn nearest_entry(&self, target: (u8, u8, u8)) -> (u8, u8, u8) {
-        let mut best = self.palette[0];
-        let mut bestd = u32::MAX;
-        for c in self.palette.iter() {
-            let d = dist(*c, target);
-            if d < bestd {
-                bestd = d;
-                best = *c;
-            }
-        }
-        best
-    }
-
-    fn ansi_of(&self, colour: (u8, u8, u8)) -> u8 {
-        let mut best = 7u8;
+    /// Nearest console colour for big text, skipping black, dark red and dark
+    /// grey so text can never disappear into the background.
+    fn text_ansi(&self) -> u8 {
+        let mut best = 15u8;
         let mut bestd = u32::MAX;
         for (i, c) in ANSI.iter().enumerate() {
-            let d = dist(*c, colour);
+            if matches!(i, 0 | 1 | 8) {
+                continue;
+            }
+            let d = dist(*c, self.text);
             if d < bestd {
                 bestd = d;
                 best = i as u8;
@@ -135,55 +158,18 @@ impl Theme {
 
     pub fn colour(&self, role: Role) -> (u8, u8, u8) {
         match role {
-            Role::Title | Role::Accent => self.accent,
-            Role::Ok => (0, 255, 80),
-            Role::Warn => (255, 210, 0),
-            Role::Err => (255, 70, 70),
-            Role::Dim => (200, 200, 210),
-            Role::Text => (255, 255, 255),
-        }
-    }
-
-    /// Pick the art colour that shares the role's hue, so "ok" only turns green
-    /// if the art actually contains a green. Falls back to the plain console
-    /// colour when the art is all reds and greys.
-    fn hued(&self, degrees: f32, fallback: u8) -> u8 {
-        let mut best: Option<(u8, u8, u8)> = None;
-        let mut best_score = 0.0f32;
-        for c in self.palette.iter() {
-            let (h, s) = hue_sat(*c);
-            if h < 0.0 || s < 0.25 {
-                continue;
-            }
-            let mut d = (h - degrees).abs();
-            if d > 180.0 {
-                d = 360.0 - d;
-            }
-            if d < 32.0 {
-                let score = s * (1.0 - d / 64.0);
-                if score > best_score {
-                    best_score = score;
-                    best = Some(*c);
-                }
-            }
-        }
-        match best {
-            Some(c) => self.ansi_of(c),
-            None => fallback,
+            Role::Title | Role::Text => self.text,
+            _ => self.small,
         }
     }
 
     pub fn sgr(&self, role: Role) -> String {
-        // Always the brightest console colour for a role. Art-derived colours
-        // kept coming out as dark reds and greys on this screen.
         let (idx, bold) = match role {
-            Role::Title => (15, true),
-            Role::Accent => (14, true),
-            Role::Ok => (10, true),
-            Role::Warn => (11, true),
-            Role::Err => (9, true),
-            Role::Dim => (7, false),
-            Role::Text => (15, false),
+            Role::Title => (self.text_ansi(), true),
+            Role::Text => (self.text_ansi(), false),
+            Role::Accent => (self.small_ansi, true),
+            Role::Dim => (self.small_ansi, false),
+            Role::Ok | Role::Warn | Role::Err => (self.small_ansi, true),
         };
         let bold = if bold { "1;" } else { "" };
         if idx < 8 {

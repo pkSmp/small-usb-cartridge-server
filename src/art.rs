@@ -15,8 +15,13 @@ pub const TTY: &str = "/dev/tty1";
 const PIO_CMAP: u64 = 0x4B71;
 const CALIB: &str = "/var/lib/cartridge/calib.json";
 
-const BLACK_MAX: u8 = 6;
-const MERGE_DIST: f64 = 12.0;
+/// Only genuinely near-black pixels are left blank. Grey and dark grey have
+/// a channel well above this and stay available to the image.
+const BLACK_MAX: u8 = 24;
+/// Colours closer than this are visually the same; merge them instead of
+/// spending two slots on almost-identical shades.
+const MERGE_DIST: f64 = 24.0;
+/// One slot is the black terminal background; the other 15 are usable colours.
 const MAX_COLOURS: usize = 15;
 const BLOCK: &str = "\u{2588}";
 const UPPER: &str = "\u{2580}";
@@ -479,11 +484,9 @@ fn quantise(img: &Image) -> Quantised {
             }
         }
     }
-    let mut colours: Vec<(Rgb, u64)> = counts
-        .iter()
-        .filter(|(c, _)| !is_black(*c))
-        .cloned()
-        .collect();
+    // Flatten first, with black still in the list so its close neighbours are
+    // merged normally. Only after that is near-black removed.
+    let mut colours: Vec<(Rgb, u64)> = counts.clone();
     let mut shown: Vec<(Rgb, Rgb)> = counts.iter().map(|(c, _)| (*c, *c)).collect();
 
     loop {
@@ -492,7 +495,7 @@ fn quantise(img: &Image) -> Quantised {
             None => break,
         };
         let (dd, a, b) = pair;
-        if dd > MERGE_DIST && colours.len() <= MAX_COLOURS {
+        if dd > MERGE_DIST && colours.len() <= MAX_COLOURS + 1 {
             break;
         }
         let ai = find(&colours, a).unwrap();
@@ -516,6 +519,15 @@ fn quantise(img: &Image) -> Quantised {
             if entry.1 == a || entry.1 == b {
                 entry.1 = avg;
             }
+        }
+    }
+
+    // A merge of two dark shades can land back in the near-black band. Drop
+    // those too; their source pixels become blank instead of a wasted slot.
+    colours.retain(|(c, _)| !is_black(*c));
+    for entry in shown.iter_mut() {
+        if is_black(entry.1) {
+            entry.1 = (0, 0, 0);
         }
     }
 
@@ -702,7 +714,12 @@ pub fn build(img: &Image, cal: &Calib) -> BuildReport {
             let bot = grid[2 * r + 1][x];
             let top_c = palette[top as usize];
             let bot_c = palette[bot as usize];
-            if top == bot {
+            if top == 0 && bot == 0 {
+                // Reset to the terminal background and leave a plain blank
+                // rather than spend a palette slot (or a black foreground)
+                // on empty pixels.
+                payload.push_str("\x1b[0m ");
+            } else if top == bot {
                 payload.push_str("\x1b[0m");
                 payload.push_str(&fg_for(top));
                 payload.push_str(BLOCK);

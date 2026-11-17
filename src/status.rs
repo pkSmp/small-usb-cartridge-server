@@ -124,18 +124,22 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
     o.kv(
         "machine",
         &format!(
-            "{} drive(s), {} storage, {} RAM (limits are automatic)",
+            "{} internal drive(s), {} internal storage, {} RAM (limits are automatic)",
             drives,
             sys::human(capacity),
             sys::human(crate::voice::mem_total_kb() * 1024)
         ),
     );
 
-        let mut sites = 0usize;
+    // The live release is on the internal disk. Measure that, never the
+    // cartridge mount: the cartridge is removable and is not storage here.
+    let live = Path::new(LIVE);
+    let mut sites = 0usize;
     let mut rows: Vec<[String; 4]> = Vec::new();
+    let mut total_kb = 0u64;
     let ip = sys::lan_ip();
 
-    let mut dirs: Vec<PathBuf> = fs::read_dir(mount)
+    let mut dirs: Vec<PathBuf> = fs::read_dir(live)
         .map(|it| it.flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect())
         .unwrap_or_default();
     dirs.sort();
@@ -144,17 +148,21 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
+        let kb = sys::disk_kb(&dir);
         sites += 1;
+        total_kb += kb;
         rows.push([
             format!("`{}`", name),
             format!("`{}/`", name),
-            sys::human_kb(sys::apparent_kb(&dir)),
+            sys::human_kb(kb),
             site_url(&ip, &name),
         ]);
     }
-    if mount.join("index.html").is_file() {
+    let index = live.join("index.html");
+    if index.is_file() {
         sites += 1;
-        let size = fs::metadata(mount.join("index.html")).map(|m| m.len()).unwrap_or(0);
+        let size = fs::metadata(&index).map(|m| m.len()).unwrap_or(0);
+        total_kb += size.div_ceil(1024);
         rows.push([
             "`80`".into(),
             "`/`".into(),
@@ -164,7 +172,7 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
     }
     o.kv(
         "total",
-        &format!("{} website(s), {}", sites, sys::human_kb(sys::apparent_kb(mount))),
+        &format!("{} website(s), {}", sites, sys::human_kb(total_kb)),
     );
     if !rows.is_empty() {
         site_table(o, &rows);
@@ -179,8 +187,7 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
             Some(name) => {
                 let p = mount.join("sounds").join(name);
                 if p.is_file() {
-                    let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                    o.kv(label, &format!("`{}` {} {}", key, name, sys::human(size)));
+                    o.kv(label, &format!("`{}` {}", key, name));
                 } else {
                     o.kv(
                         label,
@@ -199,13 +206,12 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
     if boot.is_file() {
         o.kv(
             "art",
-            &format!("boot.png {}", sys::human(fs::metadata(&boot).map(|m| m.len()).unwrap_or(0))),
+            "boot.png",
         );
     } else {
         o.kv("art", &o.p(Role::Dim, "no boot.png (keeping the current art)"));
     }
 
-    let total_kb = sys::apparent_kb(mount);
     let free_kb = Command::new("df")
         .args(["-B1", "--output=avail", "/srv/cartridge"])
         .output()
@@ -217,7 +223,7 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
     // RAM never refuses: publish stages what fits and links the rest.
     let verdict = if total_kb + 131_072 > free_kb {
         format!(
-            "refuse: {} > {} free on storage",
+            "refuse: {} > {} free on internal storage",
             sys::human_kb(total_kb),
             sys::human_kb(free_kb)
         )

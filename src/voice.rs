@@ -129,6 +129,32 @@ pub fn mem_avail_kb() -> u64 {
     mem_kb("MemAvailable:")
 }
 
+/// True for a block disk that can be detached: USB buses, card readers and
+/// anything the kernel marks removable. The cartridge itself is removable, so
+/// it is excluded here too and can never inflate the machine's storage count.
+fn removable_disk(name: &str) -> bool {
+    let base = format!("/sys/block/{}", name);
+    for flag in ["removable", "device/removable"] {
+        if fs::read_to_string(format!("{}/{}", base, flag))
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    if let Ok(target) = fs::read_link(format!("{}/device", base)) {
+        if target.to_string_lossy().to_ascii_lowercase().contains("usb") {
+            return true;
+        }
+    }
+    fs::read_to_string(format!("{}/device/transport", base))
+        .map(|v| v.trim().eq_ignore_ascii_case("usb"))
+        .unwrap_or(false)
+}
+
+/// Count internal disks only. Removable media (USB sticks, microSD and SD
+/// cards, card readers) is deliberately left out of both the drive count and
+/// the capacity total.
 pub fn hardware() -> (u64, u64) {
     let mut count = 0u64;
     let mut bytes = 0u64;
@@ -138,7 +164,7 @@ pub fn hardware() -> (u64, u64) {
             let skip = ["loop", "ram", "zram", "sr", "fd", "dm-", "md", "nbd"]
                 .iter()
                 .any(|p| name.starts_with(p));
-            if skip {
+            if skip || removable_disk(&name) {
                 continue;
             }
             let size = fs::read_to_string(entry.path().join("size"))
@@ -489,7 +515,7 @@ pub fn summary() -> String {
     let ram_total = mem_total_kb() * 1024;
     let (total, ram, disk, _) = staging();
     format!(
-        "{} drive(s), {} storage, {} RAM · sites {} ({} in RAM, {} on disk) · {} line(s) · {}",
+        "{} internal drive(s), {} internal storage, {} RAM · sites {} ({} in RAM, {} on disk) · {} line(s) · {}",
         drives,
         sys::human(capacity),
         sys::human(ram_total),

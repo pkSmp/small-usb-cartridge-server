@@ -548,7 +548,7 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
     let free = free_kb("/srv/cartridge");
     let need = total_kb + 131_072;
     log(&format!(
-        "storage: {} free, cartridge is {}; RAM staging is automatic",
+        "storage: {} free internally, sites are {}; RAM staging is automatic",
         fmt_bytes(free * 1024),
         fmt_bytes(total_kb * 1024)
     ));

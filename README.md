@@ -23,11 +23,11 @@ serving. Web server, import, art, sound and status are all one
 | **Cartridge in, sites out** | A udev rule runs `cartridge import` on the new block device. The stick is mounted read-only, validated against `config.json`, and published as a new release. |
 | **Served from RAM** | The live release is copied into a tmpfs and served from memory, so a page view never touches the disk. |
 | **Folders are ports** | `3000/` becomes `http://host:3000/`, and a root `index.html` becomes port 80. No config needed. |
-| **Boot art** | `boot.png` is converted to coloured half-block cells (50x32) and painted on the framebuffer console at every boot. |
+| **Boot art** | `boot.png` is converted to coloured half-block cells (50x32). Near-black pixels are left blank (grey and dark grey are kept), near-identical shades are merged, and up to 15 non-black palette colours are used. |
 | **Voice from the cartridge** | Every line is a WAV named after its sentence. The import maps config keys to those files and the player speaks them in order; a missing line is simply silent. |
 | **Audio never copied** | The clips stay on the stick, mounted read-only. The server keeps no WAV of its own; pulling the stick stops speech and clears the spoken text. |
 | **No wasted writes** | Files whose name and SHA-256 already match the running release are hard-linked into the new release instead of being written again. Replaying the same stick writes 0 bytes. |
-| **Live status screen** | Under the art, in bright colours: a Markdown table of ports, folders, sizes and URLs, machine and staging facts, a pinned start test, and a word-typed "what it said" history cleared on reboot or cartridge removal. |
+| **Live status screen** | Under the art: the Markdown site table, machine and staging facts, a pinned start test, and a word-typed "what it said" history. Big text uses the brightest colour from the art; small labels use bright red or light green from the art. Storage counts internal disks and the internal live release only - removable media and the cartridge are never added. |
 
 ## Setup (5 minutes)
 
@@ -124,15 +124,17 @@ loadgen download HOST PORT PATH [CONNS]
 - **Import.** Mounts read-only through the mount syscall, copies the sites into
   `.staging`, then renames into `releases/<timestamp>` and flips a symlink. Old
   releases are pruned. Nothing is written to the stick and no audio is copied.
-- **Art.** `boot.png` is decoded by the built-in PNG reader, quantised to the console
-  palette, written as half-block cells, and verified by reading the framebuffer back
-  and comparing every sampled pixel with the expectation.
+- **Art.** `boot.png` is decoded by the built-in PNG reader, near-black pixels are
+  left blank, near-identical shades are merged, and the remaining colours fill up to
+  15 non-black palette slots. The half-block cells are verified by reading the
+  framebuffer back and comparing every sampled pixel with the expectation.
 - **Sound.** Playback reads WAV straight from the cartridge mount and writes it to
   the HDMI PCM device through `SNDRV_PCM_IOCTL_HW_PARAMS` + `write` + `DRAIN`;
   `aplay` exists only as a fallback. Jobs queue in a file and speak one at a time.
 - **Status.** Reads `/proc`, the release directory and the import log. The console
-  draws the Markdown site table, machine facts and the spoken history; removing the
-  stick clears the sound map, queue, history and stale mount.
+  draws the Markdown site table, machine facts and the spoken history; site sizes and
+  storage totals come from the internal live release, never the cartridge. Removing
+  the stick clears the sound map, queue, history and stale mount.
 
 ## Commands
 

@@ -318,16 +318,20 @@ pub fn human(bytes: u64) -> String {
         format!("{} B", bytes)
     } else if bytes < 1048576 {
         format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
+    } else if bytes < 1073741824 {
         format!("{:.1} MB", bytes as f64 / 1048576.0)
+    } else {
+        format!("{:.1} GB", bytes as f64 / 1073741824.0)
     }
 }
 
 pub fn human_kb(kb: u64) -> String {
     if kb < 1024 {
         format!("{} KB", kb)
-    } else {
+    } else if kb < 1048576 {
         format!("{:.1} MB", kb as f64 / 1024.0)
+    } else {
+        format!("{:.1} GB", kb as f64 / 1048576.0)
     }
 }
 

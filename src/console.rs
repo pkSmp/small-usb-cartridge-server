@@ -261,7 +261,7 @@ fn draw_status() {
             stamp,
             theme.paint(Role::Ok, "USB"),
             theme.paint(Role::Text, &first.dev),
-            first.size,
+            theme.paint(Role::Text, &first.size),
             if first.label == "(no label)" {
                 String::new()
             } else {
@@ -272,13 +272,19 @@ fn draw_status() {
 
     let (sites, total_kb) = live_rows();
     if sites.is_empty() {
-        block.push(format!("{}  none published", theme.paint(Role::Dim, "sites")));
+        block.push(format!(
+            "{}  {}",
+            theme.paint(Role::Dim, "sites"),
+            theme.paint(Role::Text, "none published")
+        ));
     } else {
         block.push(format!(
-            "{}  {} site(s), {} live",
+            "{}  {}",
             theme.paint(Role::Dim, "sites"),
-            sites.len(),
-            sys::human_kb(total_kb)
+            theme.paint(
+                Role::Text,
+                &format!("{} site(s), {} live", sites.len(), sys::human_kb(total_kb))
+            )
         ));
         for line in table_lines(&sites) {
             block.push(theme.paint(Role::Text, &line));
