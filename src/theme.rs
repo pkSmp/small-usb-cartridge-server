@@ -1,9 +1,10 @@
 //! Colours taken entirely from the boot art. No palette slot is reserved for
 //! text: the image owns all 16 slots, and the console chooses existing image
-//! colours for its text. Small labels use the closest bright saturated red,
-//! pink or green, with the dark maroon shades only as a fallback; big text uses
-//! the image colour closest to white. The console palette is the art palette,
-//! so a colour must be emitted through the slot that actually holds it.
+//! colours for its text. Small labels use the closest strongly saturated red
+//! or green in the image, so actual red/green hues win over pale pinks; big
+//! text uses the image colour closest to white. The console palette is the art
+//! palette, so a colour must be emitted through the slot that actually holds
+//! it.
 
 use crate::json;
 use std::fs;
@@ -34,11 +35,6 @@ const TEXT_FALLBACK: (u8, u8, u8) = (232, 232, 248);
 const RED_FALLBACK: (u8, u8, u8) = (255, 96, 96);
 const BRIGHT_RED: (u8, u8, u8) = (255, 0, 0);
 const BRIGHT_GREEN: (u8, u8, u8) = (0, 255, 0);
-/// Dark crimson/maroon reads as black against the console background. Prefer
-/// brighter reds and pinks when the image has one; keep the dark shades only
-/// as a last-resort fallback. `luminance` is weighted RGB, so 100/255 is
-/// 100_000 in its units.
-const MIN_SMALL_LUMA: u32 = 100_000;
 
 #[derive(Clone, Copy)]
 pub enum Role {
@@ -82,37 +78,26 @@ fn is_green(c: (u8, u8, u8)) -> bool {
 }
 
 /// Beige and brown are technically reddish, but they are not the red the
-/// labels need. Require a genuinely coloured pixel before it can be chosen;
-/// the brighter salmon/pink shades sit just below the old threshold.
+/// labels need. Require a strongly saturated red/green so the pale salmon and
+/// peach tones do not beat the actual crimson.
 fn saturated(c: (u8, u8, u8)) -> bool {
     let max = c.0.max(c.1).max(c.2) as u32;
     let min = c.0.min(c.1).min(c.2) as u32;
-    max >= 64 && (max - min) * 100 / max >= 40
+    max >= 64 && (max - min) * 100 / max >= 55
 }
 
-/// Closest red/green candidate at or above a luminance floor. When two are
-/// equally close, the brighter one wins; dim shades are the fallback.
-fn pick_small(
-    palette: &[(u8, u8, u8); 16],
-    min_luma: u32,
-) -> Option<(u8, u8, u8)> {
+/// The closest strongly-saturated red or green in the art. This deliberately
+/// prefers the actual crimson (#990030) over the lighter salmon (#D89070).
+/// When two candidates are equally close, the brighter one wins.
+fn best_small(palette: &[(u8, u8, u8); 16]) -> Option<(u8, u8, u8)> {
     palette
         .iter()
         .copied()
-        .filter(|c| {
-            visible(*c)
-                && saturated(*c)
-                && (is_red(*c) || is_green(*c))
-                && luminance(*c) >= min_luma
-        })
+        .filter(|c| visible(*c) && saturated(*c) && (is_red(*c) || is_green(*c)))
         .min_by_key(|c| {
             let target = dist(*c, BRIGHT_RED).min(dist(*c, BRIGHT_GREEN));
             (target, u32::MAX - luminance(*c))
         })
-}
-
-fn best_small(palette: &[(u8, u8, u8); 16]) -> Option<(u8, u8, u8)> {
-    pick_small(palette, MIN_SMALL_LUMA).or_else(|| pick_small(palette, 0))
 }
 
 fn nearest_light(
@@ -190,9 +175,8 @@ impl Theme {
             }
         }
 
-        // Small snippets: the closest bright saturated red/pink or green in the
-        // image. The dark crimson and maroon are only a fallback when the image
-        // has no brighter candidate.
+        // Small snippets: the closest strongly saturated red or green in the
+        // image; pale salmon/peach is rejected so the crimson wins.
         let small = best_small(&palette).unwrap_or(RED_FALLBACK);
 
         // Big text: the image colour closest to white, but never the exact
