@@ -82,9 +82,18 @@ pub fn decode(data: &[u8]) -> Result<Image, String> {
     if w == 0 || h == 0 {
         return Err("png: missing IHDR".into());
     }
-    if depth != 8 {
-        return Err(format!("png: unsupported bit depth {}", depth));
-    }
+    // Palette and grey images are allowed at 1, 2 and 4 bits per pixel, which
+    // is how most logos and icons are saved; everything else is 8-bit.
+    let bits = match (depth, colour) {
+        (8, 0) | (8, 2) | (8, 3) | (8, 4) | (8, 6) => 8usize,
+        (1 | 2 | 4, 0) | (1 | 2 | 4, 3) => depth as usize,
+        _ => {
+            return Err(format!(
+                "png: unsupported bit depth {} for colour type {}",
+                depth, colour
+            ))
+        }
+    };
     if interlace != 0 {
         return Err("png: interlaced images are not supported".into());
     }
@@ -97,11 +106,11 @@ pub fn decode(data: &[u8]) -> Result<Image, String> {
         other => return Err(format!("png: unsupported colour type {}", other)),
     };
     let raw = inflate::zlib_decompress(&idat)?;
-    let stride = w * channels;
+    let stride = if bits < 8 { (w * bits).div_ceil(8) } else { w * channels };
     if raw.len() < h * (stride + 1) {
         return Err("png: image data is short".into());
     }
-    let bpp = channels;
+    let bpp = if bits < 8 { 1 } else { channels };
     let mut pixels = vec![0u8; h * stride];
     for y in 0..h {
         let src = &raw[y * (stride + 1)..];
@@ -147,16 +156,30 @@ pub fn decode(data: &[u8]) -> Result<Image, String> {
     for y in 0..h {
         for x in 0..w {
             let o = y * stride + x * channels;
-            let (r, g, b) = match colour {
-                0 => (pixels[o], pixels[o], pixels[o]),
-                2 => (pixels[o], pixels[o + 1], pixels[o + 2]),
-                3 => {
-                    let idx = pixels[o] as usize;
-                    *palette.get(idx).unwrap_or(&(0, 0, 0))
+            let (r, g, b) = if bits < 8 {
+                // Samples are packed high bits first: 1-bit is 8 pixels a byte.
+                let byte = pixels[y * stride + (x * bits) / 8];
+                let shift = 8 - bits - (x * bits) % 8;
+                let max = (1u16 << bits) - 1;
+                let sample = ((byte >> shift) as u16) & max;
+                if colour == 3 {
+                    *palette.get(sample as usize).unwrap_or(&(0, 0, 0))
+                } else {
+                    let v = (sample * 255 / max) as u8;
+                    (v, v, v)
                 }
-                4 => (pixels[o], pixels[o], pixels[o]),
-                6 => (pixels[o], pixels[o + 1], pixels[o + 2]),
-                _ => (0, 0, 0),
+            } else {
+                match colour {
+                    0 => (pixels[o], pixels[o], pixels[o]),
+                    2 => (pixels[o], pixels[o + 1], pixels[o + 2]),
+                    3 => {
+                        let idx = pixels[o] as usize;
+                        *palette.get(idx).unwrap_or(&(0, 0, 0))
+                    }
+                    4 => (pixels[o], pixels[o], pixels[o]),
+                    6 => (pixels[o], pixels[o + 1], pixels[o + 2]),
+                    _ => (0, 0, 0),
+                }
             };
             img.put(x, y, (r, g, b));
         }

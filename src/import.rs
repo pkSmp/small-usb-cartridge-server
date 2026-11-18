@@ -194,6 +194,25 @@ fn voice_line(name: &str) {
     }
 }
 
+/// Rebuild the console art from the stored boot.png and hand it to the boot
+/// service, which draws it and checks the framebuffer. The voice says when it
+/// starts and again only if the picture cannot be made.
+fn rebuild_art() {
+    crate::voice::say("ART");
+    match crate::art::cmd_build("/var/lib/cartridge/boot.png", "/var/lib/cartridge/art") {
+        Ok(0) => {
+            ok("boot art rebuilt from boot.png");
+            let exe = std::env::current_exe()
+                .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/cartridge"));
+            let _ = Command::new(exe).arg("boot-art").status();
+        }
+        _ => {
+            log("warning: boot.png could not be converted");
+            crate::voice::say("ERROR-ART");
+        }
+    }
+}
+
 fn free_kb(path: &str) -> u64 {
     Command::new("df")
         .args(["-B1", "--output=avail", path])
@@ -389,12 +408,21 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
 
     // Only touch boot.png when the cartridge really carries a different image.
     let mut boot_png_new = false;
+    let mut art_stale = false;
     let boot_src = Path::new(mnt).join("boot.png");
     if boot_src.is_file() {
         let current = format!("{}/boot.png", STATE);
         let same = crate::hash::same_file(&boot_src.to_string_lossy(), &current);
         if same {
-            skip("boot.png unchanged - art not rebuilt");
+            // Same picture on the stick is not proof the screen shows it: a
+            // failed or older build leaves stale art behind, so check the art
+            // itself and rebuild when it was not made from this file.
+            if crate::art::is_current(&current, "/var/lib/cartridge/art") {
+                skip("boot.png unchanged - the art already matches it");
+            } else {
+                warn("boot.png unchanged but the art is stale - rebuilding it");
+                art_stale = true;
+            }
         } else if fs::copy(&boot_src, format!("{}/boot.png.new", STATE)).is_ok() {
             boot_png_new = true;
         } else {
@@ -610,20 +638,11 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
         let _ = fs::remove_dir_all(format!("{}/{}", RELEASES, old));
     }
 
-    if boot_png_new {
-        let _ = fs::rename(format!("{}/boot.png.new", STATE), format!("{}/boot.png", STATE));
-        match crate::art::cmd_build(&format!("{}/boot.png", STATE), "/var/lib/cartridge/art") {
-            Ok(0) => {
-                let meta = fs::read_to_string("/var/lib/cartridge/art/map.json").unwrap_or_default();
-                let count = meta.matches("#").count();
-                let _ = count;
-                ok("boot art rebuilt from boot.png");
-                let exe = std::env::current_exe()
-                    .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/cartridge"));
-                let _ = Command::new(exe).arg("boot-art").status();
-            }
-            _ => log("warning: boot.png could not be converted"),
+    if boot_png_new || art_stale {
+        if boot_png_new {
+            let _ = fs::rename(format!("{}/boot.png.new", STATE), format!("{}/boot.png", STATE));
         }
+        rebuild_art();
     }
 
     play_sound(&complete_chime, "complete chime");

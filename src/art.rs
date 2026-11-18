@@ -1,6 +1,7 @@
 //! The console mosaic: calibration against the real framebuffer, colour
 //! quantisation, the escape payload, drawing and proof by sampling /dev/fb0.
 
+use crate::hash;
 use crate::json::{self, Value};
 use crate::png::{self, Image};
 use crate::sys;
@@ -782,10 +783,114 @@ pub fn build(img: &Image, cal: &Calib) -> BuildReport {
     }
 }
 
+/// Rows kept clear under the art for the site table, the machine line, the
+/// boot report and the transcript. A picture that ignored them would scroll
+/// the whole console and take the report off screen with it.
+const ART_RESERVED_ROWS: usize = 24;
+
+/// The console grid the art has to live in, read from the tty so the picture
+/// follows the TV's real size. 240x67 is the 1080p fallback.
+fn console_cells() -> (usize, usize) {
+    #[repr(C)]
+    struct Winsize {
+        rows: u16,
+        cols: u16,
+        xpixel: u16,
+        ypixel: u16,
+    }
+    extern "C" {
+        fn ioctl(fd: c_int, request: u64, ...) -> c_int;
+        fn open(path: *const i8, flags: c_int, ...) -> c_int;
+        fn close(fd: c_int) -> c_int;
+    }
+    const TIOCGWINSZ: u64 = 0x5413;
+    if let Ok(path) = std::ffi::CString::new(TTY) {
+        let fd = unsafe { open(path.as_ptr(), 0) };
+        if fd >= 0 {
+            let mut ws = Winsize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
+            let rc = unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize) };
+            unsafe {
+                close(fd);
+            }
+            if rc == 0 && ws.rows > 0 && ws.cols > 0 {
+                return (ws.cols as usize, ws.rows as usize);
+            }
+        }
+    }
+    (240, 67)
+}
+
+/// True when the art in `out` was really built from this exact image file.
+/// The stored copy matching the stick is not proof: a failed build or an older
+/// art leaves the screen showing something else, and only a rebuild fixes it.
+pub fn is_current(image: &str, out: &str) -> bool {
+    if !std::path::Path::new(&format!("{}/art.bin", out)).is_file() {
+        return false;
+    }
+    match (
+        fs::read_to_string(format!("{}/source", out)),
+        hash::file(image),
+    ) {
+        (Ok(stamp), Ok(now)) => stamp.trim() == now,
+        _ => false,
+    }
+}
+
+/// Reduce a picture to the console with a box average, keeping its shape. Two
+/// source rows are one cell, so the height budget is counted in rows.
+fn fit(img: &Image, max_cols: usize, max_rows: usize) -> Image {
+    let max_h = max_rows.saturating_mul(2).max(2);
+    if img.w <= max_cols && img.h <= max_h {
+        return Image { w: img.w, h: img.h, rgb: img.rgb.clone() };
+    }
+    let scale = (max_cols as f64 / img.w as f64).min(max_h as f64 / img.h as f64);
+    let nw = ((img.w as f64 * scale).floor() as usize).clamp(1, max_cols);
+    let nh = ((img.h as f64 * scale).floor() as usize).clamp(2, max_h);
+    let mut out = Image::new(nw, nh);
+    for y in 0..nh {
+        let y0 = y * img.h / nh;
+        let y1 = (((y + 1) * img.h).div_ceil(nh)).min(img.h).max(y0 + 1);
+        for x in 0..nw {
+            let x0 = x * img.w / nw;
+            let x1 = (((x + 1) * img.w).div_ceil(nw)).min(img.w).max(x0 + 1);
+            let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    let c = img.get(xx, yy);
+                    r += c.0 as u64;
+                    g += c.1 as u64;
+                    b += c.2 as u64;
+                    n += 1;
+                }
+            }
+            out.put(x, y, ((r / n) as u8, (g / n) as u8, (b / n) as u8));
+        }
+    }
+    out
+}
+
 pub fn cmd_build(image: &str, out: &str) -> Result<i32, String> {
     let cal = load_calib()?;
     let data = fs::read(image).map_err(|e| format!("cannot read {}: {}", image, e))?;
-    let img = png::decode(&data).map_err(|e| format!("{}: {}", image, e))?;
+    let source = png::decode(&data).map_err(|e| format!("{}: {}", image, e))?;
+    let (cols, rows) = console_cells();
+    let max_cols = cols.max(8);
+    let max_rows = rows.saturating_sub(ART_RESERVED_ROWS).max(8);
+    let img = fit(&source, max_cols, max_rows);
+    if img.w != source.w || img.h != source.h {
+        println!(
+            "fit: {}x{} -> {}x{} px ({}x{} cells) to leave {} rows for the report under it",
+            source.w,
+            source.h,
+            img.w,
+            img.h,
+            img.w,
+            img.h.div_ceil(2),
+            ART_RESERVED_ROWS
+        );
+    } else {
+        println!("fit: {}x{} px ({}x{} cells) fits the console", img.w, img.h, img.w, img.h.div_ceil(2));
+    }
     let report = build(&img, &cal);
 
     fs::create_dir_all(out).map_err(|e| format!("cannot create {}: {}", out, e))?;
@@ -797,10 +902,15 @@ pub fn cmd_build(image: &str, out: &str) -> Result<i32, String> {
         format!("{} {}\n", img.w, report.rows),
     )
     .map_err(|e| e.to_string())?;
+    // Which exact picture this art came from, so a later insert can tell a
+    // finished build from a stale one instead of trusting the stored copy.
+    fs::write(format!("{}/source", out), format!("{}\n", hash::bytes(&data)))
+        .map_err(|e| e.to_string())?;
 
     let map = Value::Obj(vec![
         ("image".into(), Value::Str(std::fs::canonicalize(image).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| image.into()))),
         ("size".into(), Value::Arr(vec![Value::Num(img.w as f64), Value::Num(img.h as f64)])),
+        ("source".into(), Value::Arr(vec![Value::Num(source.w as f64), Value::Num(source.h as f64)])),
         ("cells".into(), Value::Arr(vec![Value::Num(img.w as f64), Value::Num(report.rows as f64)])),
         ("cell_px".into(), Value::Arr(vec![Value::Num(8.0), Value::Num(16.0)])),
         ("origin".into(), Value::Arr(vec![Value::Num(0.0), Value::Num(0.0)])),

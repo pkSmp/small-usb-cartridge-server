@@ -72,24 +72,25 @@ fn ensure_font() -> bool {
 
 pub fn run() -> Result<i32, String> {
     log(&format!("start tty={} wait=60s", art::TTY));
+    // The voice lives on the cartridge. Mount it before anything can go wrong,
+    // so a boot picture that fails is said out loud and not only logged here.
+    let _ = crate::console::mount_cartridge();
 
     let art_path = format!("{}/art.bin", ART_DIR);
     let meta_path = format!("{}/art.meta", ART_DIR);
-    if Path::new(STATE_PNG).is_file() {
-        let newer = match (fs::metadata(STATE_PNG), fs::metadata(&art_path)) {
-            (Ok(p), Ok(a)) => p.modified().ok() > a.modified().ok(),
-            (Ok(_), Err(_)) => true,
-            _ => false,
-        };
-        if newer {
-            match art::cmd_build(STATE_PNG, ART_DIR) {
-                Ok(0) => log(&format!("art rebuilt from {}", STATE_PNG)),
-                _ => log(&format!("warning: could not build art from {}", STATE_PNG)),
+    if Path::new(STATE_PNG).is_file() && !art::is_current(STATE_PNG, ART_DIR) {
+        crate::voice::say("ART");
+        match art::cmd_build(STATE_PNG, ART_DIR) {
+            Ok(0) => log(&format!("art rebuilt from {}", STATE_PNG)),
+            _ => {
+                log(&format!("warning: could not build art from {}", STATE_PNG));
+                crate::voice::say("ERROR-ART");
             }
         }
     }
     if !Path::new(&art_path).is_file() {
         log("no art file, nothing to draw");
+        crate::voice::say("ERROR-ART");
         return Ok(0);
     }
 
@@ -112,14 +113,18 @@ pub fn run() -> Result<i32, String> {
         log("note: font probe inconclusive, drawing anyway");
     }
 
-    match art::cmd_draw(&art_path) {
-        Ok(0) => {}
-        _ => log("warning: draw failed"),
+    let drawn = matches!(art::cmd_draw(&art_path), Ok(0));
+    if !drawn {
+        log("warning: draw failed");
     }
 
-    match art::cmd_verify(&format!("{}/map.json", ART_DIR)) {
-        Ok(0) => log("framebuffer check: PASS"),
-        _ => log("framebuffer check: FAIL (see above)"),
+    let verified = drawn && matches!(art::cmd_verify(&format!("{}/map.json", ART_DIR)), Ok(0));
+    if verified {
+        log("framebuffer check: PASS");
+        crate::voice::say("ART-OK");
+    } else {
+        log("framebuffer check: FAIL (see above)");
+        crate::voice::say("ERROR-ART");
     }
 
     let rows = fs::read_to_string(&meta_path)

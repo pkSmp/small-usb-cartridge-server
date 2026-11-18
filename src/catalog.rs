@@ -5,6 +5,9 @@
 
 pub const LINES: &[(&str, &str)] = &[
     ("BOOT", "Boot OK."),
+    ("ART", "Drawing the boot screen."),
+    ("ART-OK", "The boot screen is ready."),
+    ("ERROR-ART", "The boot picture could not be drawn."),
     ("UNIT-DRIVE", "drive"),
     ("UNIT-DRIVES", "drives"),
     ("UNIT-GB-STORAGE", "gigabytes storage"),

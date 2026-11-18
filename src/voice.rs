@@ -89,6 +89,16 @@ fn push(seq: &mut Vec<String>, name: &str) {
     }
 }
 
+/// Queue one named line. The name is a config key, so the clip it points at
+/// must already be on the cartridge: a missing line stays silent rather than
+/// being invented here. Returns false when nothing was queued.
+pub fn say(name: &str) -> bool {
+    match file(name) {
+        Some(path) => enqueue(&[path]).is_ok(),
+        None => false,
+    }
+}
+
 /// How many configured lines currently resolve to a file on the cartridge.
 pub fn count() -> usize {
     fs::read_to_string(MAP)
