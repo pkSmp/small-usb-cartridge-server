@@ -19,6 +19,9 @@ mod dns;
 mod erasure;
 mod fleet;
 mod font;
+#[cfg(test)]
+mod fuzz;
+mod guard;
 mod gzip;
 mod hash;
 mod ident;

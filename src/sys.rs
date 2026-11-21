@@ -93,6 +93,32 @@ pub fn sync() {
     unsafe { sync() }
 }
 
+/// The errno of the last failed call on this thread. `io::Error::last_os_error`
+/// hides the number behind an `ErrorKind`, and `accept` needs the raw value to
+/// tell `EMFILE` (back off) from `EINVAL` (the listener is broken).
+#[cfg(target_os = "linux")]
+pub fn errno() -> i32 {
+    extern "C" {
+        fn __errno_location() -> *mut i32;
+    }
+    unsafe { *__errno_location() }
+}
+
+/// Make a FIFO. Only used to prove the importer refuses one; serving never
+/// creates them.
+#[cfg(all(test, target_os = "linux"))]
+pub fn mkfifo(path: &str) -> io::Result<()> {
+    extern "C" {
+        fn mkfifo(path: *const c_char, mode: u32) -> i32;
+    }
+    let c = std::ffi::CString::new(path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    if unsafe { mkfifo(c.as_ptr(), 0o644) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 pub fn ioctl_ptr(fd: c_int, request: c_ulong, ptr: *mut c_void) -> io::Result<()> {
     let rc = unsafe { ioctl(fd, request, ptr) };
     if rc < 0 {

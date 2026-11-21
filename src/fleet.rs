@@ -782,7 +782,17 @@ pub fn adopt() -> Result<i32, String> {
 fn materialize(bp: &Blueprint, store: &Store, epoch: u64) -> io::Result<()> {
     let dir = releases_root().join(epoch.to_string());
     for file in &bp.files {
-        let target = dir.join(&file.path);
+        // The blueprint came off a stick or a peer. A path of `../../etc/x`
+        // would otherwise be written outside the release.
+        let target = match crate::guard::safe_join(&dir, &file.path) {
+            Some(t) => t,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("blueprint path {:?} leaves the release directory", file.path),
+                ))
+            }
+        };
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1021,7 +1031,8 @@ fn usb_loop(node: Arc<Node>) {
 /// Verify and ingest one stick. The epoch comes from the fleet, not the clock.
 pub fn import_release(node: &Arc<Node>, dir: &Path) -> Result<u64, String> {
     let text = fs::read_to_string(dir.join("blueprint")).map_err(|e| format!("no blueprint: {}", e))?;
-    let bp = Blueprint::parse(&text).ok_or("blueprint is corrupt")?;
+    // Parse only to reject a corrupt blueprint before it becomes an epoch.
+    Blueprint::parse(&text).ok_or("blueprint is corrupt")?;
     match &node.key {
         Some(key) => {
             let sig = fs::read_to_string(dir.join("blueprint.sig"))

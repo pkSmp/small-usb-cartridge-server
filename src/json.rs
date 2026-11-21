@@ -93,7 +93,11 @@ pub fn quote(s: &str) -> String {
 
 pub fn parse(text: &str) -> Result<Value, String> {
     let bytes = text.as_bytes();
-    let mut p = Parser { b: bytes, i: 0 };
+    let mut p = Parser {
+        b: bytes,
+        i: 0,
+        depth: 0,
+    };
     p.ws();
     let v = p.value()?;
     p.ws();
@@ -106,6 +110,7 @@ pub fn parse(text: &str) -> Result<Value, String> {
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -120,6 +125,22 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> Result<Value, String> {
+        // A recursive-descent parser on hostile input overflows the stack, and
+        // a stack overflow in a worker aborts the whole process.
+        self.depth += 1;
+        if self.depth > crate::guard::MAX_JSON_DEPTH {
+            self.depth -= 1;
+            return Err(format!(
+                "json: nested deeper than {}",
+                crate::guard::MAX_JSON_DEPTH
+            ));
+        }
+        let out = self.value_inner();
+        self.depth -= 1;
+        out
+    }
+
+    fn value_inner(&mut self) -> Result<Value, String> {
         self.ws();
         match self.peek() {
             Some(b'{') => self.object(),

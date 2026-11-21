@@ -6,7 +6,6 @@ use crate::json::{self, Value};
 use crate::sys;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const STORE: &str = "/srv/cartridge";
 const RELEASES: &str = "/srv/cartridge/releases";
@@ -70,9 +69,9 @@ fn rebuild_art() {
     match crate::art::cmd_build("/var/lib/cartridge/boot.png", "/var/lib/cartridge/art") {
         Ok(0) => {
             ok("boot art rebuilt from boot.png");
-            let exe = std::env::current_exe()
-                .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/cartridge"));
-            let _ = Command::new(exe).arg("boot-art").status();
+            // Draw in-process: this binary *is* the boot-art program, so a
+            // udev-triggered import has no reason to fork a second copy of it.
+            let _ = crate::bootart::run();
         }
         _ => {
             log("warning: boot.png could not be converted");
@@ -81,13 +80,9 @@ fn rebuild_art() {
 }
 
 fn free_kb(path: &str) -> u64 {
-    Command::new("df")
-        .args(["-B1", "--output=avail", path])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|t| t.lines().nth(1).and_then(|l| l.trim().parse::<u64>().ok()))
-        .map(|b| b / 1024)
+    // `df` was an external program for one number the kernel already answers.
+    crate::sys::filesystem_bytes(path)
+        .map(|(_, _, free)| free / 1024)
         .unwrap_or(u64::MAX)
 }
 
@@ -139,6 +134,7 @@ fn copy_dedup(
     rel: &Path,
     skip: &[String],
     live: Option<&str>,
+    budget: &mut crate::guard::Budget,
 ) -> Result<(u64, u64, u64), String> {
     fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     let entries = fs::read_dir(src).map_err(|e| e.to_string())?;
@@ -147,6 +143,9 @@ fn copy_dedup(
     let mut saved = 0u64;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
+        if crate::guard::safe_rel(&name).is_none() {
+            continue;
+        }
         if rel.as_os_str().is_empty() && skip.iter().any(|s| *s == name) {
             continue;
         }
@@ -155,16 +154,22 @@ fn copy_dedup(
             Ok(t) => t,
             Err(_) => continue,
         };
+        // Symlinks, device nodes and FIFOs are not site files: refuse them
+        // rather than follow them into the host or block on them forever.
+        if !crate::guard::copyable(&file_type) {
+            continue;
+        }
         let target = dst.join(&name);
         let child_rel = rel.join(&name);
         if file_type.is_dir() {
-            let (r, w, s) = copy_dedup(&path, &target, &child_rel, skip, live)?;
+            let (r, w, s) = copy_dedup(&path, &target, &child_rel, skip, live, budget)?;
             reused += r;
             written += w;
             saved += s;
         } else if file_type.is_file() {
             let src_text = path.to_string_lossy().into_owned();
             let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            budget.file(len)?;
             if let Some(live_root) = live {
                 let candidate = format!("{}/{}", live_root, child_rel.to_string_lossy());
                 if crate::hash::same_file(&src_text, &candidate) {
@@ -303,12 +308,14 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
         ".Trashes".into(),
     ];
     let live_now = fs::read_link(LIVE).ok().map(|p| p.to_string_lossy().into_owned());
+    let mut budget = crate::guard::Budget::new();
     match copy_dedup(
         Path::new(mnt),
         Path::new(&staging),
         Path::new(""),
         &skip_names,
         live_now.as_deref(),
+        &mut budget,
     ) {
         Ok((reused, written, saved)) => {
             if reused > 0 {

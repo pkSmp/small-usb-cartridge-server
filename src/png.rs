@@ -73,7 +73,12 @@ pub fn decode(data: &[u8]) -> Result<Image, String> {
             b"PLTE" => {
                 palette = body.chunks(3).map(|c| (c[0], c[1], c[2])).collect();
             }
-            b"IDAT" => idat.extend_from_slice(body),
+            b"IDAT" => {
+                if idat.len() + body.len() > crate::guard::MAX_INFLATE {
+                    return Err("png: compressed data is larger than supported".into());
+                }
+                idat.extend_from_slice(body);
+            }
             b"IEND" => break,
             _ => {}
         }
@@ -81,6 +86,14 @@ pub fn decode(data: &[u8]) -> Result<Image, String> {
     }
     if w == 0 || h == 0 {
         return Err("png: missing IHDR".into());
+    }
+    // Refuse the dimensions before allocating anything from them: a 65535 x
+    // 65535 header is four bytes of text and 12 GB of pixels.
+    if w > crate::guard::MAX_IMAGE_SIDE
+        || h > crate::guard::MAX_IMAGE_SIDE
+        || w.saturating_mul(h) > crate::guard::MAX_IMAGE_PIXELS
+    {
+        return Err(format!("png: {}x{} is larger than supported", w, h));
     }
     // Palette and grey images are allowed at 1, 2 and 4 bits per pixel, which
     // is how most logos and icons are saved; everything else is 8-bit.

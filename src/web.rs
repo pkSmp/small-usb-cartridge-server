@@ -303,7 +303,8 @@ fn head_start(code: u16, ctype: &str, length: u64, gz: bool) -> (Vec<u8>, usize)
     head.extend_from_slice(ctype.as_bytes());
     head.extend_from_slice(b"\r\nContent-Length: ");
     head.extend_from_slice(length.to_string().as_bytes());
-    head.extend_from_slice(b"\r\n");
+    // Never let a browser second-guess the type we just declared.
+    head.extend_from_slice(b"\r\nX-Content-Type-Options: nosniff\r\n");
     if gz {
         head.extend_from_slice(b"Content-Encoding: gzip\r\n");
     }
@@ -454,6 +455,10 @@ struct Conn {
     requests: u32,
     deadline: Instant,
     want_write: bool,
+    /// Bytes of the current response already delivered, and when it started.
+    /// A client that never reads must not pin a socket forever.
+    sent: u64,
+    started: Instant,
 }
 
 impl Conn {
@@ -472,6 +477,8 @@ impl Conn {
             requests: 0,
             deadline: Instant::now() + HEADER_TIMEOUT,
             want_write: false,
+            sent: 0,
+            started: Instant::now(),
         }
     }
 
@@ -483,6 +490,8 @@ impl Conn {
         self.file_left = 0;
         self.requests += 1;
         self.deadline = Instant::now() + KEEPALIVE_TIMEOUT;
+        self.sent = 0;
+        self.started = Instant::now();
     }
 
     fn queue(&mut self, head: Vec<u8>, file: Option<File>, offset: i64, len: u64) {
@@ -491,6 +500,8 @@ impl Conn {
         self.file = file;
         self.file_off = offset;
         self.file_left = len;
+        self.sent = 0;
+        self.started = Instant::now();
     }
 
     fn simple(&mut self, code: u16, keep: bool, clock: &mut Clock) {
@@ -508,7 +519,7 @@ impl Conn {
         if code != 304 {
             head.extend_from_slice(b"Content-Type: text/html; charset=utf-8\r\nContent-Length: ");
             head.extend_from_slice(body.len().to_string().as_bytes());
-            head.extend_from_slice(b"\r\n");
+            head.extend_from_slice(b"\r\nX-Content-Type-Options: nosniff\r\n");
         }
         head.extend_from_slice(if keep {
             &b"Connection: keep-alive\r\n\r\n"[..]
@@ -520,6 +531,8 @@ impl Conn {
         self.out_pos = 0;
         self.file = None;
         self.file_left = 0;
+        self.sent = 0;
+        self.started = Instant::now();
         if !keep {
             self.closing = true;
         }
@@ -735,6 +748,7 @@ fn flush(conn: &mut Conn) -> io::Result<bool> {
         };
         if n > 0 {
             conn.out_pos += n as usize;
+            conn.sent += n as u64;
         } else if n == -1 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
@@ -756,6 +770,7 @@ fn flush(conn: &mut Conn) -> io::Result<bool> {
             if n > 0 {
                 conn.file_off = offset;
                 conn.file_left -= n as u64;
+                conn.sent += n as u64;
             } else if n == 0 {
                 conn.file_left = 0;
             } else {
@@ -1107,13 +1122,32 @@ fn worker(listeners: Vec<Listener>, slot: usize) {
                     Some(l) => l,
                     None => continue,
                 };
+                let mut pause_streak = 0u32;
                 loop {
                     let client = unsafe {
                         accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), SOCK_NONBLOCK | SOCK_CLOEXEC)
                     };
                     if client < 0 {
-                        break;
+                        match crate::guard::accept_action(crate::sys::errno()) {
+                            crate::guard::AcceptAction::Retry => continue,
+                            // The queue is empty: that is the normal end of the
+                            // accept batch, and looping here spins the worker.
+                            crate::guard::AcceptAction::Stop => break,
+                            // Out of descriptors: wait for one to come back
+                            // instead of spinning on an edge-triggered
+                            // listener whose readiness we just consumed.
+                            crate::guard::AcceptAction::Pause => {
+                                pause_streak += 1;
+                                if pause_streak > 3 {
+                                    break;
+                                }
+                                crate::sys::sleep_ms(crate::guard::backoff_ms(pause_streak));
+                                continue;
+                            }
+                            crate::guard::AcceptAction::Fatal => break,
+                        }
                     }
+                    pause_streak = 0;
                     let one: c_int = 1;
                     unsafe {
                         setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &one as *const _ as *const c_void, 4);
@@ -1244,7 +1278,17 @@ fn worker(listeners: Vec<Listener>, slot: usize) {
             let now = Instant::now();
             let expired: Vec<RawFd> = conns
                 .iter()
-                .filter(|(_, c)| c.deadline <= now && !c.want_write)
+                .filter(|(_, c)| {
+                    if c.deadline <= now && !c.want_write {
+                        return true;
+                    }
+                    // A client that stopped reading must not hold a socket.
+                    c.want_write
+                        && crate::guard::stalled(
+                            c.sent,
+                            now.duration_since(c.started).as_millis() as u64,
+                        )
+                })
                 .map(|(fd, _)| *fd)
                 .collect();
             for fd in expired {

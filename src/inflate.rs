@@ -99,7 +99,7 @@ const DIST_EXTRA: [u32; 30] = [
     13, 13,
 ];
 
-fn inflate_into(br: &mut BitReader, out: &mut Vec<u8>) -> Result<(), String> {
+fn inflate_into(br: &mut BitReader, out: &mut Vec<u8>, limit: usize) -> Result<(), String> {
     loop {
         let last = br.bits(1)?;
         let kind = br.bits(2)?;
@@ -110,6 +110,9 @@ fn inflate_into(br: &mut BitReader, out: &mut Vec<u8>) -> Result<(), String> {
                 let nlen = br.bits(16)? as usize;
                 if len != (!nlen & 0xFFFF) {
                     return Err("deflate: stored block length mismatch".into());
+                }
+                if out.len() + len > limit {
+                    return Err("inflate: output exceeds the limit".into());
                 }
                 for _ in 0..len {
                     out.push(br.bits(8)? as u8);
@@ -134,7 +137,7 @@ fn inflate_into(br: &mut BitReader, out: &mut Vec<u8>) -> Result<(), String> {
                 }
                 let lit = Huffman::build(&lit_lengths)?;
                 let dist = Huffman::build(&dist_lengths)?;
-                inflate_block(br, out, &lit, &dist)?;
+                inflate_block(br, out, &lit, &dist, limit)?;
             }
             2 => {
                 let hlit = br.bits(5)? as usize + 257;
@@ -183,7 +186,7 @@ fn inflate_into(br: &mut BitReader, out: &mut Vec<u8>) -> Result<(), String> {
                 }
                 let lit = Huffman::build(&lengths[..hlit])?;
                 let dist = Huffman::build(&lengths[hlit..])?;
-                inflate_block(br, out, &lit, &dist)?;
+                inflate_block(br, out, &lit, &dist, limit)?;
             }
             _ => return Err("deflate: reserved block type".into()),
         }
@@ -198,8 +201,14 @@ fn inflate_block(
     out: &mut Vec<u8>,
     lit: &Huffman,
     dist: &Huffman,
+    limit: usize,
 ) -> Result<(), String> {
     loop {
+        // One symbol emits at most 258 bytes, so checking per symbol never
+        // overshoots the limit by more than one match.
+        if out.len() >= limit {
+            return Err("inflate: output exceeds the limit".into());
+        }
         let sym = lit.decode(br)? as usize;
         if sym < 256 {
             out.push(sym as u8);
@@ -229,6 +238,12 @@ fn inflate_block(
 }
 
 pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    zlib_decompress_limited(data, crate::guard::MAX_INFLATE)
+}
+
+/// Decompress with an explicit output cap. The cap is checked as the output
+/// grows, so a 10 KB bomb that expands to 10 GB stops at the cap.
+pub fn zlib_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     if data.len() < 2 {
         return Err("zlib: too short".into());
     }
@@ -245,11 +260,16 @@ pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     }
     let mut out = Vec::new();
     let mut br = BitReader::new(&data[2..]);
-    inflate_into(&mut br, &mut out)?;
+    inflate_into(&mut br, &mut out, limit)?;
     Ok(out)
 }
 
 pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    gzip_decompress_limited(data, crate::guard::MAX_INFLATE)
+}
+
+/// Decompress a gzip stream with an explicit output cap.
+pub fn gzip_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     if data.len() < 18 || data[0] != 0x1F || data[1] != 0x8B {
         return Err("gzip: bad magic".into());
     }
@@ -282,7 +302,7 @@ pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     }
     let mut out = Vec::new();
     let mut br = BitReader::new(&data[i..]);
-    inflate_into(&mut br, &mut out)?;
+    inflate_into(&mut br, &mut out, limit)?;
     Ok(out)
 }
 
