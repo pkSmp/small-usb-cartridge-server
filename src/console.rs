@@ -1,11 +1,13 @@
 //! The report under the art: a Markdown table of every live site (port,
-//! folder, size, URL) and the machine and staging facts. Mirrors the import
-//! log to /var/log/cartridge/console.log.
+//! folder, size, URL), the machine and staging facts, and the newest import
+//! and boot messages as plain text. Mirrors the import log to
+//! /var/log/cartridge/console.log.
 
 use crate::art;
 use crate::machine;
 use crate::sys;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 const IMPORT_LOG: &str = "/var/log/cartridge/import.log";
@@ -164,8 +166,101 @@ fn table_lines(rows: &[[String; 4]]) -> Vec<String> {
     out
 }
 
+
+/// The last few kilobytes of a log, without the partial first line.
+fn tail_lines(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(mut f) = fs::File::open(path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let skip = len.saturating_sub(8192);
+        if f.seek(SeekFrom::Start(skip)).is_ok() {
+            let mut buf = String::new();
+            if f.read_to_string(&mut buf).is_ok() {
+                let mut lines: Vec<&str> = buf.lines().collect();
+                if skip > 0 && !lines.is_empty() {
+                    lines.remove(0); // the seek may have landed mid-line
+                }
+                out = lines.into_iter().map(|l| l.to_string()).collect();
+            }
+        }
+    }
+    out
+}
+
+/// Wrap one line to the screen width without breaking words.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if line.is_empty() {
+            line.push_str(word);
+        } else if line.chars().count() + 1 + word.chars().count() <= width {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            out.push(line.clone());
+            line.clear();
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+/// The message feed: the newest import and boot lines, oldest first. Both logs
+/// start with a timestamp, so merging by time keeps them in the real order.
+/// Nothing here waits for a device: a line is on screen on the next redraw.
+fn recent_messages(theme: &crate::theme::Theme, cols: usize) -> Vec<String> {
+    use crate::theme::Role;
+    let width = cols.saturating_sub(2).max(20);
+    let mut raw: Vec<(String, String, String)> = Vec::new();
+    for (path, default_tag) in [
+        ("/var/log/cartridge/import.log", "info"),
+        ("/var/log/cartridge/art.log", "art"),
+    ] {
+        for line in tail_lines(path) {
+            let line = line.trim_end();
+            if line.len() < 21 {
+                continue;
+            }
+            let stamp = &line[..19];
+            let rest = line[19..].trim_start();
+            let (tag, text) = match rest.split_once(char::is_whitespace) {
+                Some((t, m)) if matches!(t, "info" | "ok" | "warn" | "err" | "skip") => {
+                    (t.to_string(), m.trim_start().to_string())
+                }
+                _ => (default_tag.to_string(), rest.to_string()),
+            };
+            // The site table is drawn above, so its log copy is not a message.
+            if text.is_empty() || text.starts_with('|') || text == "websites found:" {
+                continue;
+            }
+            raw.push((stamp.to_string(), tag, text));
+        }
+    }
+    raw.sort_by(|a, b| a.0.cmp(&b.0));
+    let start = raw.len().saturating_sub(40);
+    let mut out = Vec::new();
+    for (stamp, tag, text) in &raw[start..] {
+        let role = match tag.as_str() {
+            "ok" => Role::Ok,
+            "warn" => Role::Warn,
+            "err" => Role::Err,
+            "skip" | "art" => Role::Dim,
+            _ => Role::Text,
+        };
+        let clock = if stamp.len() >= 19 { &stamp[11..19] } else { "--:--:--" };
+        for part in wrap(&format!("{} {:<5} {}", clock, tag, text), width) {
+            out.push(theme.paint(role, &part));
+        }
+    }
+    out
+}
+
 fn draw_status() {
-    let (rows, _cols) = terminal_size();
+    let (rows, cols) = terminal_size();
     let heights = fs::read_to_string(ART_ROWS)
         .ok()
         .and_then(|t| t.lines().next().and_then(|v| v.trim().parse::<usize>().ok()))
@@ -225,6 +320,22 @@ fn draw_status() {
         theme.paint(Role::Dim, "machine"),
         theme.paint(Role::Text, &machine::summary())
     ));
+
+    // Fill what is left with the newest messages, oldest at the top. A line
+    // appears on the next redraw, so the screen keeps up with the import.
+    let messages = recent_messages(&theme, cols);
+    if !messages.is_empty() {
+        let available = rows.saturating_sub(h + 2);
+        let room = available.saturating_sub(block.len() + 2);
+        if room > 0 {
+            let start = messages.len().saturating_sub(room);
+            block.push(String::new());
+            block.push(theme.paint(Role::Accent, "messages"));
+            for line in &messages[start..] {
+                block.push(line.clone());
+            }
+        }
+    }
     block.push(theme.paint(Role::Dim, "login   Ctrl+Alt+F2"));
 
     let mut out = String::new();
@@ -278,7 +389,7 @@ pub fn run() -> Result<i32, String> {
         if !console_ok && probe_console() {
             console_ok = true;
         }
-        // Redraw every second so USB and release changes appear.
+        // Redraw four times a second so a new message is on screen at once.
         if art_done() {
             draw_status();
         }
@@ -289,7 +400,6 @@ pub fn run() -> Result<i32, String> {
                 log_pos = 0;
             }
             if meta.len() > log_pos {
-                use std::io::{Read, Seek, SeekFrom};
                 if let Ok(mut f) = fs::File::open(IMPORT_LOG) {
                     if f.seek(SeekFrom::Start(log_pos)).is_ok() {
                         let mut buf = String::new();
@@ -304,6 +414,6 @@ pub fn run() -> Result<i32, String> {
             }
         }
 
-        sys::sleep_ms(1000);
+        sys::sleep_ms(250);
     }
 }
