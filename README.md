@@ -42,9 +42,10 @@ keeps serving. Web server, import, art and status are all one
    install -m 0644 systemd/99-cartridge-net.conf /etc/sysctl.d/ && sysctl -p /etc/sysctl.d/99-cartridge-net.conf
    systemctl daemon-reload && systemctl enable --now cartridge-web cartridge-console
    ```
-3. **Make a cartridge.** Format a stick as FAT32 or ext4, add a `config.json`, one
-   folder per port and an optional `boot.png`, then plug it in. The new sites appear
-   on screen and in the import log.
+3. **Make a cartridge.** Format a stick as FAT32 or ext4, put a `config.json`
+   holding `{}` at the root, add one digits-only folder per port and an optional
+   `boot.png`, then plug it in. The new sites appear on screen and in the import
+   log.
 4. **Check it.**
    ```
    cartridge status
@@ -53,18 +54,36 @@ keeps serving. Web server, import, art and status are all one
 ## The cartridge
 
 ```
-config.json     {} - marks the stick as a cartridge
-3000/index.html -> http://<host>:3000/
-8080/           -> http://<host>:8080/
-index.html      -> http://<host>/          (port 80)
-boot.png        optional; becomes the TV art
-README.txt      optional, ignored by the importer
+config.json      required; must contain a JSON object, {} is enough
+3000/index.html  -> http://<host>:3000/
+8080/            -> http://<host>:8080/
+index.html       -> http://<host>/            (port 80)
+www/             not a port of its own
+boot.png         optional; becomes the TV art
+README.txt       optional; ignored by the importer
 ```
 
-The folders are the configuration: a numeric folder name is the port. A stick without
-`config.json` is left alone, so an ordinary USB drive is never imported by accident.
-The server stages the sites into RAM automatically; there are no `ram_mb` or
-`storage_mb` limits to configure.
+- **`config.json` must be a JSON object.** `{}` is enough. `null`, `[]`, a
+  broken file or a file that is not there means the stick is not a cartridge:
+  a missing file is left alone, an invalid one is refused. Nothing inside it is
+  read yet, so the file itself is the marker.
+- **A top-level folder is a port only if every character of its name is a
+  digit.** `8080/` becomes port 8080. Any other folder is copied with the
+  release but never served on its own; put it inside a port folder instead, so
+  `8080/img/` is served as `/img/`.
+- **A top-level `index.html` makes a port 80 site** out of the root of the
+  stick. Without it there is no port 80 site, and the port folders are served
+  exactly the same.
+- **Everything else at the root belongs to the port 80 site.** The importer
+  skips only `config.json`, `boot.png`, `README.txt`, `readme.txt`,
+  `System Volume Information`, `$RECYCLE.BIN` and `.Trashes`; any other stray
+  file becomes a URL, so keep the stick clean.
+- **The stick is never written.** It is mounted read-only, the sites are copied
+  off it, and the server stages them into RAM itself; there are no `ram_mb` or
+  `storage_mb` limits to configure.
+
+The folders are the configuration. A stick without `config.json` is left alone,
+so an ordinary USB drive is never imported by accident.
 
 ## Cluster mode
 
