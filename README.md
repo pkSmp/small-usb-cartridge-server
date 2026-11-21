@@ -93,21 +93,46 @@ That is the whole configuration. Nothing has to be listed, paired or named.
   cartridge transfers nothing, so a stick inserted in one box is on all of them
   in about as long as it takes to copy it once.
 - **Load.** `cartridge cluster` owns the public ports and hands each connection
-  either to a local worker or to a peer. A connection stays local until the box
-  holds one connection per core of budget; only then does it go to a peer that
-  is at least 20 % quieter, measured in connections per core of budget. That
-  budget is the CPU the box may really use, so a container limited to half a
-  core advertises half a core however many workers it starts. A request
-  forwarded in by another box is always answered locally, so two boxes   can never bounce one request between them. A burst that arrives between two
-  beacons is spread over the quieter peers at random, weighted by their budget,
-  so it lands in proportion to what each box can serve instead of on whichever
-  one happens to be quietest, and if a chosen peer refuses the connection the
-  request is served locally instead of being dropped. The relay is `splice(2)` in both
-  directions: bytes move from socket to socket through the kernel, costing two
-  syscalls per 64 KiB and no copies into user space.
+  either to a local worker or to a peer. Nothing about a fleet of mixed PCs is
+  taken on trust: every box times the responses it actually gets -- from its own
+  workers and from each peer -- and keeps an EWMA of the time to first byte.
+  That one number carries the CPU, the disk, the memory and the link in front of
+  a machine, which a worker count cannot: a throttled container with two workers
+  and a modern core with two workers stop looking alike after a few requests.
+  A connection stays local until the box holds one connection per core of
+  budget. Then the choice is the shortest expected wait, `(connections + 1) x
+  measured response time`. The budget is still the CPU the box may really use
+  (its cgroup quota), so a container limited to half a core advertises half a
+  core however many workers it starts, and it is the weight of the URL space a
+  box owns. A peer on another release, or with no release yet, is never offered
+  work it would answer with stale bytes. A request forwarded in by another box
+  is always answered locally, so two boxes can never bounce one request between
+  them, and if a chosen peer refuses the connection the request is served
+  locally instead of being dropped.
+- **Placement.** The balancer reads the request line before it commits a
+  connection, so it knows which file is wanted. Every URL has one owner, chosen
+  by weighted rendezvous hashing over the fleet: the boxes agree on the owner
+  without asking each other, bigger/faster boxes own proportionally more of the
+  URL space, and a box joining or leaving moves only its own share. A file then
+  lives hot in one machine's page cache instead of every box in the rack holding
+  a copy of every site. Ownership gives way to load -- an owner more than twice
+  as slow as the best machine at that moment hands the URL back -- and a
+  connection that only pre-connects, sending no request line within 40 ms, is
+  placed by load instead. The relay is `splice(2)` in both directions after the
+  first couple of kilobytes: only the request head is ever copied into user
+  space.
 
 `cartridge status` and the console show the peers, which of them serve the same
-release, and how much of the load this box took.
+release, how long each takes to answer, and how much of the load this box took.
+
+Measured on the 2-core box with three fake boxes on one switch, all serving the
+same release, with one, a half and a quarter of a core and **two workers on each
+of the small pair** (so worker count cannot explain the result): 64 connections
+over 64 different URLs split **64 % / 31 % / 5 %**, against 57 / 29 / 14 by
+budget and 65 / 22 / 12 by the raw throughput their own workers measured
+(41.5k / 13.9k / 7.4k rps). Ten connections for a single URL left 8 or 10 of
+them on that URL's one owner, and the eight URLs tested had owners on every node
+in the fleet, not just the one the traffic entered. 12,800 requests, no errors.
 
 What the relay costs, measured on this box with the balancer in front of two
 workers and no peers: **30,060 rps** (p50 0.52 ms at 16 connections, 1.07 ms at

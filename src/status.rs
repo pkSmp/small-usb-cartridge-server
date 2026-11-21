@@ -438,11 +438,13 @@ fn cluster_block(o: &Out) {
     o.kv(
         "load",
         &format!(
-            "{} served here, {} forwarded to peers",
+            "{} served now, {} handed to peers, {} served since boot",
             num("busy"),
-            num("forwarded")
+            num("forwarded"),
+            num("served")
         ),
     );
+    o.kv("speed", &format!("{:.1} ms to first byte", num("tfa") as f64 / 10.0));
     let empty: Vec<crate::json::Value> = Vec::new();
     let peers = state.get("peers").and_then(|v| v.as_arr()).unwrap_or(&empty);
     if peers.is_empty() {
@@ -459,11 +461,12 @@ fn cluster_block(o: &Out) {
         }
         let release = peer.get("release").and_then(|v| v.as_str()).unwrap_or("");
         o.line(&format!(
-            "{:<15} {} · {} worker(s) · {} busy · {}",
+            "{:<15} {} · {} worker(s) · {} busy · {:.1} ms · {}",
             ip,
             if release.is_empty() { "no release" } else { release },
             peer.get("workers").and_then(|v| v.as_i64()).unwrap_or(0),
             peer.get("busy").and_then(|v| v.as_i64()).unwrap_or(0),
+            peer.get("tfa").and_then(|v| v.as_i64()).unwrap_or(0) as f64 / 10.0,
             if in_sync {
                 o.p(Role::Ok, "in sync")
             } else {

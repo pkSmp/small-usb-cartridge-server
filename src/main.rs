@@ -17,6 +17,7 @@ mod import;
 mod inflate;
 mod json;
 mod machine;
+mod placement;
 mod png;
 mod publish;
 mod status;
