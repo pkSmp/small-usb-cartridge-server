@@ -350,17 +350,18 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
         dirs.sort();
         for dir in dirs {
             let name = dir.file_name().unwrap().to_string_lossy().to_string();
-            if !name.chars().all(|c| c.is_ascii_digit()) || name.is_empty() {
+            // The same rule the stager uses: 80 or 1024 and above.
+            let Some(port) = crate::guard::port_folder(&name) else {
                 continue;
-            }
+            };
             let kb = sys::disk_kb(&dir);
             subtotal_kb += kb;
             table.push([
-                format!("`{}`", name),
+                format!("`{}`", port),
                 format!("`{}/`", name),
                 fmt_bytes(kb * 1024),
             ]);
-            ports.push(name);
+            ports.push(port.to_string());
             sites += 1;
         }
     }

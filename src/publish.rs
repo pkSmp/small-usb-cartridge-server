@@ -90,19 +90,22 @@ fn fill(src: &Path, dst: &Path, root: bool, used: &mut u64, budget: u64, st: &mu
 
 fn ports_of(root: &Path) -> Vec<u16> {
     let mut ports: Vec<u16> = Vec::new();
-    if root.join("80").is_dir() || root.join("index.html").is_file() {
+    if root.join("index.html").is_file() {
         ports.push(80);
     }
     if let Ok(entries) = fs::read_dir(root) {
         let mut found: Vec<u16> = entries
             .flatten()
             .filter(|e| e.path().is_dir())
-            .filter_map(|e| e.file_name().to_string_lossy().parse::<u16>().ok())
-            .filter(|p| (1024..=65535).contains(p))
+            // One rule for folders, shared with the importer's listing.
+            .filter_map(|e| crate::guard::port_folder(&e.file_name().to_string_lossy()))
             .collect();
         found.sort_unstable();
+        found.dedup();
         ports.extend(found);
     }
+    ports.sort_unstable();
+    ports.dedup();
     ports
 }
 
@@ -231,4 +234,27 @@ pub fn run() -> Result<i32, String> {
     }
     log(&format!("serving {} ({}) · {}", root.display(), mode, machine::summary()));
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_real_ports_are_published() {
+        let dir = std::env::temp_dir().join(format!("cartridge-ports-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for name in ["8080", "443", "www", "80", "99999"] {
+            fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        fs::write(dir.join("index.html"), b"<html>").unwrap();
+        assert_eq!(ports_of(&dir), vec![80, 8080]);
+
+        // `80/` on its own is the same site as a root index.html, once.
+        let only = dir.join("only80");
+        fs::create_dir_all(only.join("80")).unwrap();
+        assert_eq!(ports_of(&only), vec![80]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

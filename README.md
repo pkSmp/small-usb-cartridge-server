@@ -67,10 +67,11 @@ README.txt       optional; ignored by the importer
   broken file or a file that is not there means the stick is not a cartridge:
   a missing file is left alone, an invalid one is refused. Nothing inside it is
   read yet, so the file itself is the marker.
-- **A top-level folder is a port only if every character of its name is a
-  digit.** `8080/` becomes port 8080. Any other folder is copied with the
-  release but never served on its own; put it inside a port folder instead, so
-  `8080/img/` is served as `/img/`.
+- **A top-level folder is a port only if its name is all digits and the number
+  is 80 or at least 1024.** `8080/` becomes port 8080, and `80/` is the same as
+  a root `index.html`. `www/`, `443/` and `99999/` are not ports: they are
+  copied with the release but have no URL of their own, so put them inside a
+  port folder — `8080/img/` is served as `/img/`.
 - **A top-level `index.html` makes a port 80 site** out of the root of the
   stick. Without it there is no port 80 site, and the port folders are served
   exactly the same.

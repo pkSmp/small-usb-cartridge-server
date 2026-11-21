@@ -113,6 +113,22 @@ impl Budget {
     }
 }
 
+/// A top-level folder names a public port only when its name is all digits and
+/// the number is one the web tier can bind: 80, or 1024 and above. `www/`,
+/// `443/` and `99999/` are not ports. The importer and the stager must agree,
+/// or the import log advertises a URL nothing listens on.
+pub fn port_folder(name: &str) -> Option<u16> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let port: u16 = name.parse().ok()?;
+    if port == 80 || port >= 1024 {
+        Some(port)
+    } else {
+        None
+    }
+}
+
 /// The only two entry kinds an import may copy. A stick can carry symlinks,
 /// device nodes and FIFOs; following a symlink would read the host, a device
 /// node would stream an endless zero source, and a FIFO would block forever.
@@ -343,6 +359,20 @@ mod tests {
         let err = crate::json::parse(&deep).expect_err("400 levels must be refused");
         assert!(err.contains("nested"), "unexpected error: {}", err);
         assert!(crate::json::parse("{\"a\":[1,2]}").is_ok());
+    }
+
+    #[test]
+    fn only_bindable_numbers_are_ports() {
+        assert_eq!(port_folder("8080"), Some(8080));
+        assert_eq!(port_folder("1024"), Some(1024));
+        assert_eq!(port_folder("80"), Some(80));
+        assert_eq!(port_folder("65535"), Some(65535));
+        assert_eq!(port_folder("443"), None, "nothing binds below 1024");
+        assert_eq!(port_folder("99999"), None);
+        assert_eq!(port_folder("www"), None);
+        assert_eq!(port_folder(""), None);
+        assert_eq!(port_folder("+80"), None, "only digits, not signed numbers");
+        assert_eq!(port_folder("-1"), None);
     }
 
     #[test]
