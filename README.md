@@ -97,7 +97,10 @@ That is the whole configuration. Nothing has to be listed, paired or named.
   holds one per core; only then does it go to the peer with the fewest
   connections per core, and only if that peer is 20 % quieter. A request
   forwarded in by another box is always answered locally, so two boxes can
-  never bounce one request between them. The relay is `splice(2)` in both
+  never bounce one request between them. A burst that arrives between two
+  beacons is spread over the equally quiet peers at random, so one box does not
+  take the whole burst, and if a chosen peer refuses the connection the request
+  is served locally instead of being dropped. The relay is `splice(2)` in both
   directions: bytes move from socket to socket through the kernel, costing two
   syscalls per 64 KiB and no copies into user space.
 
@@ -111,6 +114,17 @@ sockets per request halve the ceiling; a second box on the switch more than
 makes that back, and a page view never notices half a millisecond. A box that
 has nobody to share with can be run without the daemon, serving its ports
 directly as before.
+
+Tested with four fake nodes on one PC (two workers each, so every node behaves
+like a two-core box) and with the real box plus two fake nodes on it. The nodes
+find each other, a node that starts empty pulls the live release from the real
+server and serves it on its own ports, and load arriving on the real server's
+public port is spread: 32 connections went 2 local, 20 to one node and 10 to the
+other. Adding nodes on the *same* machine does not raise the total - one 24
+thread PC went from 81,000 rps on a single node to 76,000 with four, and the
+real box stayed at 12,300 both alone and with two fake nodes, because the relay
+is an extra hop that competes for the same cores. The gain comes from separate
+boxes, where each node brings its own cores; that is the case the switch is for.
 
 ## Where things live
 
@@ -194,7 +208,7 @@ loadgen download HOST PORT PATH [CONNS]
 | Command | What it does |
 |---|---|
 | `cartridge web [--root DIR] [--workers N] [--bind ADDR]` | serve a directory; `--workers 0` (default) is one per CPU thread, `--bind 127.0.0.1` keeps the ports for the cluster daemon |
-| `cartridge cluster [--root DIR] [--name ID]` | find the boxes on the switch, keep one release between them, split the load |
+| `cartridge cluster [--root DIR] [--name ID] [--offset N]` | find the boxes on the switch, keep one release between them, split the load; `--offset` mirrors `web --offset` for a second copy on one machine |
 | `cartridge import DEVICE` | ingest a stick |
 | `cartridge publish` | copy the live release into RAM |
 | `cartridge status [--watch]` | machine, stick, staging, sites, URLs |

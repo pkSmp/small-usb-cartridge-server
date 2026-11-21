@@ -1101,36 +1101,66 @@ fn score(busy: u32, workers: u32) -> f32 {
     (busy + 1) as f32 / workers.max(1) as f32
 }
 
+/// xorshift64, only used to break ties between equally quiet peers: a burst of
+/// connections that all arrive before the next beacon should spread over the
+/// whole cluster instead of piling onto whichever peer happens to be first.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Rng {
+        Rng(if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed })
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+}
+
 /// Which machine should serve this connection. Local until this box has one
 /// connection per core, then the peer with the fewest connections per core, but
 /// only when it is clearly quieter (20 %), so the cluster never bounces a
 /// request for a marginal gain.
-fn choose(shared: &Shared, src: Ipv4Addr, index: usize) -> (Target, u16) {
+fn choose(shared: &Shared, src: Ipv4Addr, index: usize, rng: &mut Rng) -> (Target, u16) {
     let local_busy = shared.busy.load(Ordering::Relaxed);
     let workers = shared.workers.max(1);
     if local_busy < workers {
         return (Target::Local, 0);
     }
     let local = score(local_busy, workers);
-    let mut best: Option<(f32, Ipv4Addr, u16)> = None;
-    for peer in shared.snapshot().iter() {
-        if peer.ip == src {
-            // Never send a request back to the machine it came from.
-            continue;
-        }
+    let peers = shared.snapshot();
+    if peers.iter().any(|p| p.ip == src) {
+        // The request came from another node, so this is already the second
+        // machine it has visited. Serve it here: forwarding a forwarded request
+        // would build a chain and add a hop for every node on the switch.
+        return (Target::Local, 0);
+    }
+    let mut best = f32::MAX;
+    let mut candidates: Vec<(Ipv4Addr, u16)> = Vec::new();
+    for peer in peers.iter() {
         let port = match peer.ports.get(index) {
             Some(p) => *p,
             None => continue,
         };
         let s = score(peer.busy, peer.workers);
-        if best.map(|b| s < b.0).unwrap_or(true) {
-            best = Some((s, peer.ip, port));
+        if s < best - 0.001 {
+            best = s;
+            candidates.clear();
+            candidates.push((peer.ip, port));
+        } else if (s - best).abs() <= 0.001 {
+            candidates.push((peer.ip, port));
         }
     }
-    match best {
-        Some((s, ip, port)) if s * 1.25 < local => (Target::Peer(ip), port),
-        _ => (Target::Local, 0),
+    if candidates.is_empty() || !(best * 1.25 < local) {
+        return (Target::Local, 0);
     }
+    let pick = (rng.next() % candidates.len() as u64) as usize;
+    let (ip, port) = candidates[pick];
+    (Target::Peer(ip), port)
 }
 
 fn bind_public(port: u16) -> io::Result<RawFd> {
@@ -1177,7 +1207,13 @@ fn close_relay(id: u64, relays: &mut HashMap<u64, Relay>, shared: &Shared) {
     }
 }
 
-fn balancer(listeners: Vec<(RawFd, usize)>, ports: Vec<u16>, shared: Arc<Shared>, root: PathBuf) {
+fn balancer(
+    listeners: Vec<(RawFd, usize)>,
+    ports: Vec<u16>,
+    shared: Arc<Shared>,
+    root: PathBuf,
+    offset: u16,
+) {
     let epfd = unsafe { epoll_create1(SOCK_CLOEXEC) };
     if epfd < 0 {
         log("err", "cluster: epoll_create1 failed");
@@ -1188,6 +1224,11 @@ fn balancer(listeners: Vec<(RawFd, usize)>, ports: Vec<u16>, shared: Arc<Shared>
     }
     let mut relays: HashMap<u64, Relay> = HashMap::new();
     let mut next_id: u64 = 1;
+    let mut rng = Rng::new(
+        (std::process::id() as u64).wrapping_mul(0x2545_f491_4f6c_dd1d)
+            ^ sys::now_secs() as u64
+            ^ (ports.first().copied().unwrap_or(1) as u64) << 32,
+    );
     let mut events = vec![EpollEvent { events: 0, data: 0 }; 256];
     let mut next_sweep = Instant::now() + Duration::from_secs(2);
 
@@ -1226,10 +1267,19 @@ fn balancer(listeners: Vec<(RawFd, usize)>, ports: Vec<u16>, shared: Arc<Shared>
                         }
                         break;
                     }
-                    let (target, port) = choose(&shared, addr.ip(), site_index);
+                    let (mut target, port) = choose(&shared, addr.ip(), site_index, &mut rng);
                     let server = match target {
                         Target::Local => connect_fd(Ipv4Addr::LOCALHOST, ports[site_index]),
-                        Target::Peer(ip) => connect_fd(ip, port),
+                        Target::Peer(ip) => match connect_fd(ip, port) {
+                            Ok(fd) => Ok(fd),
+                            // The peer went away between its beacon and this
+                            // connect (restart, cable, reboot): keep the request
+                            // instead of dropping the browser's connection.
+                            Err(_) => {
+                                target = Target::Local;
+                                connect_fd(Ipv4Addr::LOCALHOST, ports[site_index])
+                            }
+                        },
                     };
                     let server = match server {
                         Ok(fd) => fd,
@@ -1316,7 +1366,10 @@ fn balancer(listeners: Vec<(RawFd, usize)>, ports: Vec<u16>, shared: Arc<Shared>
             }
             // A new cartridge changes the port set: let systemd start us again,
             // the same way a SIGHUP restarts the web tier.
-            let now_ports: Vec<u16> = web::scan(&root).iter().map(|s| s.port).collect();
+            let now_ports: Vec<u16> = web::scan(&root)
+                .iter()
+                .map(|s| s.port.saturating_add(offset))
+                .collect();
             if now_ports != ports {
                 log("ok", "cluster: the site set changed; restarting to pick up the new ports");
                 std::process::exit(0);
@@ -1334,6 +1387,7 @@ pub fn run(
     beacon: u16,
     workers: usize,
     name: Option<String>,
+    offset: u16,
 ) -> Result<(), String> {
     let node = name.unwrap_or_else(node_id);
     let worker_count = if workers == 0 {
@@ -1342,7 +1396,9 @@ pub fn run(
         workers.clamp(1, 128) as u32
     };
     let sites = web::scan(&root);
-    let ports: Vec<u16> = sites.iter().map(|s| s.port).collect();
+    // The same offset the workers were started with, so a second copy on the
+    // same machine can serve the same release on a different port set.
+    let ports: Vec<u16> = sites.iter().map(|s| s.port.saturating_add(offset)).collect();
 
     let mut listeners: Vec<(RawFd, usize)> = Vec::new();
     for (i, port) in ports.iter().enumerate() {
@@ -1451,8 +1507,8 @@ pub fn run(
         let shared = shared.clone();
         let root = root.clone();
         let ports = ports.clone();
-        std::thread::spawn(move || balancer(set, ports, shared, root));
+        std::thread::spawn(move || balancer(set, ports, shared, root, offset));
     }
-    balancer(first, ports, shared, root);
+    balancer(first, ports, shared, root, offset);
     Ok(())
 }

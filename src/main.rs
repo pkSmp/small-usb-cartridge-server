@@ -33,7 +33,7 @@ fn usage() -> ! {
          \n\
          commands:\n\
          \x20 web [--root DIR] [--offset N] [--workers N] [--bind ADDR]   serve the cartridge sites\n\
-         \x20 cluster [--root DIR] [--name ID]   share sites and load with the boxes on the switch\n\
+         \x20 cluster [--root DIR] [--name ID] [--offset N]   share sites and load with the boxes on the switch\n\
          \x20 publish                        copy the live release into RAM\n\
          \x20 import DEVICE                  ingest a cartridge\n\
          \x20 status [--watch]               report what the machine sees\n\
@@ -190,6 +190,7 @@ fn run_cluster(args: &[String]) -> Result<i32, String> {
     let mut control = cluster::DEFAULT_CONTROL;
     let mut beacon = cluster::DEFAULT_BEACON;
     let mut workers: usize = 0;
+    let mut offset: u16 = 0;
     let mut name: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -218,6 +219,12 @@ fn run_cluster(args: &[String]) -> Result<i32, String> {
                 }
                 i += 2;
             }
+            "--offset" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    offset = v;
+                }
+                i += 2;
+            }
             "--name" => {
                 name = args.get(i + 1).cloned();
                 i += 2;
@@ -225,7 +232,7 @@ fn run_cluster(args: &[String]) -> Result<i32, String> {
             _ => i += 1,
         }
     }
-    cluster::run(root, control, beacon, workers, name)?;
+    cluster::run(root, control, beacon, workers, name, offset)?;
     Ok(0)
 }
 
