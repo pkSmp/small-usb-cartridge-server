@@ -61,7 +61,7 @@ impl Value {
         }
     }
 
-    /// Dotted lookup for "sounds.complete" style keys.
+    /// Dotted lookup such as "a.b".
     pub fn at(&self, dotted: &str) -> Option<&Value> {
         let mut node = self;
         for part in dotted.split('.') {

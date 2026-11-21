@@ -9,21 +9,18 @@
 
 mod art;
 mod bootart;
-mod catalog;
-mod config;
 mod console;
 mod font;
 mod hash;
 mod import;
 mod inflate;
 mod json;
+mod machine;
 mod png;
 mod publish;
-mod sound;
 mod status;
 mod sys;
 mod theme;
-mod voice;
 mod web;
 
 use std::path::PathBuf;
@@ -41,10 +38,6 @@ fn usage() -> ! {
          \x20 sites                          live sites and ports as a table\n\
          \x20 console                        status lines under the art\n\
          \x20 boot-art                       draw the boot mosaic\n\
-         \x20 announce [--usage]             queue the machine and staging report\n\
-         \x20 say [--now] NAME               queue (or play) one voice line\n\
-         \x20 voice-serve                    play the voice queue in order\n\
-         \x20 forget                         stop speech and clear what was said\n\
          \x20 art calibrate [--order rgb|bgr]\n\
          \x20 art verify-calibrate\n\
          \x20 art build IMAGE --out DIR\n\
@@ -67,7 +60,6 @@ fn main() -> ExitCode {
         "status" => status::run(args[2..].iter().any(|a| a == "--watch" || a == "-w")),
         "sites" => status::sites_cmd(),
         "console" => console::run(),
-        "sound" => run_sound(&args[2..]),
         "hash" => {
             for p in &args[2..] {
                 match hash::file(p) {
@@ -91,31 +83,6 @@ fn main() -> ExitCode {
             }
         }
         "boot-art" => bootart::run(),
-        "announce" => {
-            let full = !args[2..].iter().any(|a| a == "--usage");
-            match voice::announce(full) {
-                Ok(n) => {
-                    println!("queued {} line(s): {}", n, voice::summary());
-                    Ok(0)
-                }
-                Err(e) => Err(e),
-            }
-        }
-        "say" => run_say(&args[2..]),
-        "voice-serve" => voice::serve(),
-        "forget" => {
-            console::forget_dialogue();
-            println!("dialogue cleared");
-            Ok(0)
-        }
-        "mount-usb" => {
-            if console::mount_cartridge() {
-                println!("mounted at {}", voice::MOUNT);
-            } else {
-                println!("no cartridge to mount");
-            }
-            Ok(0)
-        }
         "version" | "--version" => {
             println!("cartridge {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
@@ -131,51 +98,6 @@ fn main() -> ExitCode {
             eprintln!("cartridge: {}", e);
             ExitCode::from(1)
         }
-    }
-}
-
-fn run_say(args: &[String]) -> Result<i32, String> {
-    let now = args.iter().any(|a| a == "--now");
-    let name = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .ok_or("say needs a line name, for example: say boot")?;
-    let path = crate::voice::file(name)
-        .ok_or_else(|| format!("{} is not on the inserted cartridge", name))?;
-    if !std::path::Path::new(&path).is_file() {
-        return Err(format!("{} is missing", path));
-    }
-    if now {
-        crate::voice::play_now(&[path.clone()]);
-        println!("played {}", path);
-    } else {
-        crate::voice::enqueue(&[path.clone()])?;
-        println!("queued {} - the voice service plays it in order", path);
-    }
-    Ok(0)
-}
-
-fn run_sound(args: &[String]) -> Result<i32, String> {
-    match args.first().map(String::as_str) {
-        Some("install") => Err(
-            "audio lives only on the cartridge; nothing is installed on this machine".into(),
-        ),
-        Some("play") => {
-            let kind = args.get(1).map(|s| s.as_str()).unwrap_or("complete");
-            let path = if kind.contains('/') {
-                kind.to_string()
-            } else {
-                sound::builtin(kind)
-            };
-            match sound::play(&path) {
-                Ok(how) => {
-                    println!("played {} via {}", path, how);
-                    Ok(0)
-                }
-                Err(e) => Err(e),
-            }
-        }
-        _ => Err("sound: expected install or play [complete|failed|FILE]".into()),
     }
 }
 

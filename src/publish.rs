@@ -2,7 +2,7 @@
 //! leave the rest on storage through symlinks. The whole release stays on disk
 //! for the next boot. The budget is read from the machine, never from a file.
 
-use crate::voice;
+use crate::machine;
 use crate::sys;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -135,8 +135,8 @@ pub fn run() -> Result<i32, String> {
     let total = measure(&release, true);
     let sites = ports_of(&release).len() as u64;
 
-    let total_kb = voice::mem_total_kb();
-    let avail_kb = voice::mem_avail_kb();
+    let total_kb = machine::mem_total_kb();
+    let avail_kb = machine::mem_avail_kb();
     // Never take more than half of RAM, and always keep a quarter in reserve.
     let reserve_kb = (total_kb / 4).max(262_144);
     let mut budget_kb = avail_kb.saturating_sub(reserve_kb).min(total_kb / 2);
@@ -174,7 +174,7 @@ pub fn run() -> Result<i32, String> {
                     "{{\"total_bytes\":{},\"ram_bytes\":{},\"disk_bytes\":{},\"ram_files\":{},\"disk_files\":{},\"budget_bytes\":{},\"mem_total_kb\":{},\"mem_avail_kb\":{},\"sites\":{}}}\n",
                     total, st.ram, st.disk, st.ram_files, st.disk_files, budget_bytes, total_kb, avail_kb, sites
                 );
-                let _ = fs::write(voice::USAGE, report);
+                let _ = fs::write(machine::USAGE, report);
                 log(&format!(
                     "{} total: {} staged in RAM ({}), {} linked to disk ({}), budget {}{}",
                     sys::human(total),
@@ -205,7 +205,7 @@ pub fn run() -> Result<i32, String> {
     if empty {
         let _ = fs::write(root.join("index.html"), NO_CARTRIDGE);
         let _ = fs::write(
-            voice::USAGE,
+            machine::USAGE,
             "{\"total_bytes\":0,\"ram_bytes\":0,\"disk_bytes\":0,\"ram_files\":0,\"disk_files\":0,\"sites\":0}\n",
         );
     }
@@ -222,13 +222,13 @@ pub fn run() -> Result<i32, String> {
         notify_web();
     }
     // A last safety check: RAM must still be comfortably available.
-    let left = voice::mem_avail_kb();
+    let left = machine::mem_avail_kb();
     if left < total_kb / 8 {
         log(&format!(
             "warning: only {} RAM free after staging; the web server may be short",
             sys::human(left * 1024)
         ));
     }
-    log(&format!("serving {} ({}) · {}", root.display(), mode, voice::summary()));
+    log(&format!("serving {} ({}) · {}", root.display(), mode, machine::summary()));
     Ok(0)
 }

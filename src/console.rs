@@ -1,9 +1,9 @@
 //! The report under the art: a Markdown table of every live site (port,
-//! folder, size, URL), the machine and staging facts, and the line being
-//! spoken typed out as it is heard. Mirrors the import log to
-//! /var/log/cartridge/console.log.
+//! folder, size, URL) and the machine and staging facts. Mirrors the import
+//! log to /var/log/cartridge/console.log.
 
 use crate::art;
+use crate::machine;
 use crate::sys;
 use std::fs;
 use std::path::Path;
@@ -164,79 +164,8 @@ fn table_lines(rows: &[[String; 4]]) -> Vec<String> {
     out
 }
 
-/// Everything the voice has said, newest last. The log keeps the lines after
-/// they are spoken, so this is a history, not a now-playing line.
-fn said_lines() -> Vec<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut out: Vec<String> = Vec::new();
-    if let Ok(mut f) = fs::File::open(crate::voice::LOG) {
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-        if f.seek(SeekFrom::Start(len.saturating_sub(16384))).is_ok() {
-            let mut buf = String::new();
-            if f.read_to_string(&mut buf).is_ok() {
-                for line in buf.lines() {
-                    let t = line.trim_start();
-                    let text = if t.len() >= 8 && t.as_bytes()[2] == b':' && t.as_bytes()[5] == b':' {
-                        t[8..].trim_start()
-                    } else {
-                        t
-                    };
-                    if !text.is_empty() {
-                        out.push(text.to_string());
-                    }
-                }
-            }
-        }
-    }
-    if out.is_empty() {
-        if let Ok(now) = fs::read_to_string(crate::voice::NOW) {
-            let t = now.trim();
-            if !t.is_empty() {
-                out.push(t.to_string());
-            }
-        }
-    }
-    out
-}
-
-/// Wrap one said line to the screen width without breaking words.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if line.is_empty() {
-            line.push_str(word);
-        } else if line.chars().count() + 1 + word.chars().count() <= width {
-            line.push(' ');
-            line.push_str(word);
-        } else {
-            out.push(line.clone());
-            line.clear();
-            line.push_str(word);
-        }
-    }
-    if !line.is_empty() {
-        out.push(line);
-    }
-    out
-}
-
-/// The pinned boot report: text only, kept across reboots until a cartridge is
-/// inserted and removed.
-fn start_test() -> Vec<String> {
-    fs::read_to_string(crate::voice::START)
-        .ok()
-        .map(|text| {
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.trim().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn draw_status() {
-    let (rows, cols) = terminal_size();
+    let (rows, _cols) = terminal_size();
     let heights = fs::read_to_string(ART_ROWS)
         .ok()
         .and_then(|t| t.lines().next().and_then(|v| v.trim().parse::<usize>().ok()))
@@ -294,36 +223,8 @@ fn draw_status() {
     block.push(format!(
         "{}  {}",
         theme.paint(Role::Dim, "machine"),
-        theme.paint(Role::Text, &crate::voice::summary())
+        theme.paint(Role::Text, &machine::summary())
     ));
-    let start = start_test();
-    if !start.is_empty() {
-        block.push(String::new());
-        block.push(theme.paint(Role::Accent, "start test"));
-        for line in &start {
-            for wrapped in wrap(line, cols.saturating_sub(2).max(20)) {
-                block.push(theme.paint(Role::Text, &wrapped));
-            }
-        }
-    }
-
-    // Fill what is left under the art with the spoken history, newest last;
-    // lines stay after they finish and only scroll when they no longer fit.
-    let mut history: Vec<String> = Vec::new();
-    for line in said_lines() {
-        history.extend(wrap(&line, cols.saturating_sub(2).max(20)));
-    }
-    if !history.is_empty() {
-        block.push(String::new());
-        block.push(theme.paint(Role::Accent, "what it said"));
-        let available = rows.saturating_sub(h + 2);
-        let fixed = block.len() + 1;
-        let room = available.saturating_sub(fixed);
-        let start = history.len().saturating_sub(room);
-        for line in &history[start..] {
-            block.push(theme.paint(Role::Text, line));
-        }
-    }
     block.push(theme.paint(Role::Dim, "login   Ctrl+Alt+F2"));
 
     let mut out = String::new();
@@ -342,69 +243,6 @@ fn draw_status() {
     }
     out.push_str("\x1b[0m");
     tty_write(&out);
-}
-
-/// Keep the cartridge mounted read-only while it is inserted. The audio is
-/// read straight off it; the server never keeps a copy.
-pub fn mount_cartridge() -> bool {
-    if sys::is_mountpoint(crate::voice::MOUNT) {
-        return true;
-    }
-    let _ = fs::create_dir_all(crate::voice::MOUNT);
-    let dev = match sys::usb_list().into_iter().next() {
-        Some(u) => u.dev,
-        None => return false,
-    };
-    match sys::mount_ro(&dev, crate::voice::MOUNT) {
-        Ok(()) => {
-            log_line(&format!(
-                "{} mounted {} at {}",
-                sys::fmt_time("%F %T"),
-                dev,
-                crate::voice::MOUNT
-            ));
-            true
-        }
-        Err(e) => {
-            log_line(&format!(
-                "{} could not mount {}: {}",
-                sys::fmt_time("%F %T"),
-                dev,
-                e
-            ));
-            false
-        }
-    }
-}
-
-/// The cartridge was pulled: stop speaking, drop the queue and erase every
-/// spoken line. The boot/start text survives until this first removal.
-pub fn forget_dialogue() {
-    let _ = fs::write(crate::voice::QUEUE, "");
-    let _ = fs::write(crate::voice::NOW, "\n");
-    let _ = fs::remove_file(crate::voice::LOG);
-    let _ = fs::remove_file(crate::voice::MAP);
-    let _ = fs::remove_file(crate::voice::START);
-    let _ = fs::remove_dir_all("/var/lib/cartridge/sounds");
-    let _ = fs::remove_dir_all("/var/lib/cartridge/voice");
-    // Older builds cached audio here as well; remove every format, not just
-    // WAV, so no sound survives on the server after the cartridge is pulled.
-    if let Ok(entries) = fs::read_dir("/var/lib/cartridge") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("current-") {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
-    let _ = sys::umount_lazy(crate::voice::MOUNT);
-    let _ = std::process::Command::new("systemctl")
-        .args(["kill", "--signal=SIGTERM", "cartridge-voiced.service"])
-        .status();
-    log_line(&format!(
-        "{} cartridge removed; dialogue cleared",
-        sys::fmt_time("%F %T")
-    ));
 }
 
 pub fn run() -> Result<i32, String> {
@@ -435,21 +273,12 @@ pub fn run() -> Result<i32, String> {
     }
 
     let mut log_pos = fs::metadata(IMPORT_LOG).map(|m| m.len()).unwrap_or(0);
-    let mut was_present = !sys::usb_list().is_empty();
 
     loop {
         if !console_ok && probe_console() {
             console_ok = true;
         }
-        let present = !sys::usb_list().is_empty();
-        if was_present && !present {
-            forget_dialogue();
-        }
-        if present {
-            mount_cartridge();
-        }
-        was_present = present;
-        // Redraw every second so the spoken transcript grows as it is heard.
+        // Redraw every second so USB and release changes appear.
         if art_done() {
             draw_status();
         }

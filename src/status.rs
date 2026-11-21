@@ -1,7 +1,7 @@
 //! `cartridge status`: a short, colour-coded report of what the machine sees.
 //! Read-only: it mounts an unmounted cartridge read-only and never writes.
 
-use crate::config;
+use crate::machine;
 use crate::sys;
 use crate::theme::{Role, Theme};
 use std::fs;
@@ -68,49 +68,41 @@ fn site_url(ip: &str, port: &str) -> String {
     }
 }
 
-fn audio_block(o: &Out) {
-    o.head("audio");
-    let cards = fs::read_to_string("/proc/asound/cards").unwrap_or_default();
-    let mut named: Vec<String> = Vec::new();
-    for line in cards.lines() {
-        let t = line.trim_start();
-        if t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && t.contains('[') {
-            named.push(t.split_whitespace().collect::<Vec<_>>().join(" "));
-        }
-    }
-    if named.is_empty() {
-        o.kv("card", &o.p(Role::Warn, "none - the chime is skipped"));
-    } else {
-        for n in named.iter().take(2) {
-            o.kv("card", n);
-        }
-        let pcm = fs::read_to_string("/proc/asound/pcm").unwrap_or_default();
-        if let Some(line) = pcm.lines().find(|l| l.contains("playback")) {
-            let name = line.split(':').nth(1).unwrap_or("").trim();
-            if !name.is_empty() {
-                o.kv("output", name);
-            }
-        }
-    }
-    let lines = crate::voice::count();
-    let mounted = sys::is_mountpoint(crate::voice::MOUNT);
+/// Machine and staging facts: what the box has and where the sites were put.
+fn machine_block(o: &Out) {
+    o.head("machine");
+    let (drives, capacity) = machine::hardware();
+    let (store_total, store_used, store_left) = machine::storage();
     o.kv(
-        "sounds",
-        &if mounted {
+        "drives",
+        &format!(
+            "{} internal drive(s), {} internal storage",
+            drives,
+            sys::human(capacity)
+        ),
+    );
+    o.kv(
+        "storage",
+        &if store_total > 0 {
             format!(
-                "{} line(s) on the cartridge at {}",
-                lines,
-                crate::voice::MOUNT
+                "{} used, {} left of {} (OS and server included)",
+                sys::human(store_used),
+                sys::human(store_left),
+                sys::human(store_total)
             )
         } else {
-            o.p(
-                Role::Warn,
-                &format!("{} line(s) remembered; cartridge not inserted", lines),
-            )
+            o.p(Role::Warn, "usage unavailable")
         },
     );
-    o.kv("audio", "never copied to this machine");
-    o.kv("staging", &crate::voice::summary());
+    o.kv(
+        "ram",
+        &format!(
+            "{} total, {} available",
+            sys::human(machine::mem_total_kb() * 1024),
+            sys::human(machine::mem_avail_kb() * 1024)
+        ),
+    );
+    o.kv("staging", &machine::summary());
 }
 
 fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
@@ -118,17 +110,16 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
     if !conf.is_file() {
         return false;
     }
-    let cfg = config::load(&conf).unwrap_or_default();
     o.line(&format!("{} cartridge", o.p(Role::Ok, "*")));
-    let (drives, capacity) = crate::voice::hardware();
-    let (store_total, store_used, store_left) = crate::voice::storage();
+    let (drives, capacity) = machine::hardware();
+    let (store_total, store_used, store_left) = machine::storage();
     o.kv(
         "machine",
         &format!(
             "{} internal drive(s), {} internal storage, {} RAM (limits are automatic)",
             drives,
             sys::human(capacity),
-            sys::human(crate::voice::mem_total_kb() * 1024)
+            sys::human(machine::mem_total_kb() * 1024)
         ),
     );
     o.kv(
@@ -190,30 +181,6 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
     );
     if !rows.is_empty() {
         site_table(o, &rows);
-    }
-
-    o.kv(
-        "sounds",
-        &format!("{} dialogue(s) configured in sounds/", cfg.sounds.len()),
-    );
-    for (label, key) in [("copying", "COPYING"), ("complete", "COMPLETE"), ("error", "ERROR")] {
-        match cfg.sounds.get(key) {
-            Some(name) => {
-                let p = mount.join("sounds").join(name);
-                if p.is_file() {
-                    o.kv(label, &format!("`{}` {}", key, name));
-                } else {
-                    o.kv(
-                        label,
-                        &o.p(
-                            Role::Warn,
-                            &format!("`{}` {} missing (built-in chime)", key, name),
-                        ),
-                    );
-                }
-            }
-            None => o.kv(label, &o.p(Role::Dim, &format!("`{}` not set", key))),
-        }
     }
 
     let boot = mount.join("boot.png");
@@ -481,7 +448,7 @@ fn report(o: &Out) {
         o.p(Role::Title, "cartridge"),
         o.p(Role::Dim, &sys::fmt_time("%Y-%m-%d %H:%M:%S"))
     );
-    audio_block(o);
+    machine_block(o);
     usb_block(o);
     serving_block(o);
     history_block(o);
