@@ -136,6 +136,9 @@ struct Peer {
     release: String,
     fp: String,
     workers: u32,
+    /// Cores this peer may really use, in hundredths. A node that runs four
+    /// workers under a half-core CPU quota is half a core of capacity, not four.
+    capacity: u32,
     busy: u32,
     ports: Vec<u16>,
     seen: Instant,
@@ -152,6 +155,7 @@ struct ReleaseInfo {
 struct Shared {
     node: String,
     workers: u32,
+    capacity: u32,
     control: u16,
     ports: Mutex<Vec<u16>>,
     busy: AtomicU32,
@@ -297,14 +301,15 @@ fn beacon_text(shared: &Shared) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "CART1 {} {} {} {} {} {} {}\n",
+        "CART1 {} {} {} {} {} {} {} {}\n",
         shared.node,
         if info.name.is_empty() { "-" } else { &info.name },
         if info.fp.is_empty() { "-" } else { &info.fp },
         shared.workers,
         shared.busy.load(Ordering::Relaxed),
         shared.control,
-        ports_text
+        ports_text,
+        shared.capacity
     )
 }
 
@@ -317,13 +322,20 @@ fn parse_beacon(text: &str, from: Ipv4Addr) -> Option<Peer> {
         .split(',')
         .filter_map(|p| p.parse::<u16>().ok())
         .collect();
+    let workers: u32 = fields[4].parse().ok()?;
+    // Older nodes send no capacity field; their core count is the best guess.
+    let capacity: u32 = fields
+        .get(8)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(workers * 100);
     Some(Peer {
         id: fields[1].to_string(),
         ip: from,
         control: fields[6].parse().ok()?,
         release: if fields[2] == "-" { String::new() } else { fields[2].to_string() },
         fp: if fields[3] == "-" { String::new() } else { fields[3].to_string() },
-        workers: fields[4].parse().ok()?,
+        workers,
+        capacity: capacity.max(1),
         busy: fields[5].parse().ok()?,
         ports,
         seen: Instant::now(),
@@ -776,11 +788,12 @@ fn write_state(shared: &Shared) {
     let peers = shared.snapshot();
     let q = crate::json::quote;
     let mut text = format!(
-        "{{\"node\":{},\"release\":{},\"fingerprint\":{},\"workers\":{},\"busy\":{},\"forwarded\":{},\"peers\":[",
+        "{{\"node\":{},\"release\":{},\"fingerprint\":{},\"workers\":{},\"capacity\":{},\"busy\":{},\"forwarded\":{},\"peers\":[",
         q(&shared.node),
         q(&info.name),
         q(&info.fp),
         shared.workers,
+        shared.capacity,
         shared.busy.load(Ordering::Relaxed),
         shared.forwarded.load(Ordering::Relaxed)
     );
@@ -790,11 +803,12 @@ fn write_state(shared: &Shared) {
         }
         let same = !info.fp.is_empty() && p.fp == info.fp;
         text.push_str(&format!(
-            "{{\"ip\":{},\"release\":{},\"fingerprint\":{},\"workers\":{},\"busy\":{},\"in_sync\":{}}}",
+            "{{\"ip\":{},\"release\":{},\"fingerprint\":{},\"workers\":{},\"capacity\":{},\"busy\":{},\"in_sync\":{}}}",
             q(&p.ip.to_string()),
             q(&p.release),
             q(&p.fp),
             p.workers,
+            p.capacity,
             p.busy,
             if same { "true" } else { "false" }
         ));
@@ -1097,8 +1111,26 @@ fn retarget_local(r: &mut Relay, epfd: c_int, id: u64, shared: &Shared) -> bool 
     }
 }
 
-fn score(busy: u32, workers: u32) -> f32 {
-    (busy + 1) as f32 / workers.max(1) as f32
+fn score(busy: u32, capacity: u32) -> f32 {
+    (busy * 100 + 100) as f32 / capacity.max(1) as f32
+}
+
+/// Cores this process may actually use, in hundredths, from the cgroup CPU
+/// quota. A node in a container limited to half a core but started with four
+/// workers has half a core of capacity; without a quota this returns None and
+/// the node advertises its worker count.
+fn cgroup_capacity() -> Option<u32> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim().to_string();
+    let text = std::fs::read_to_string(format!("/sys/fs/cgroup{}/cpu.max", path)).ok()?;
+    let mut it = text.split_whitespace();
+    let quota = it.next()?;
+    let period: u64 = it.next()?.parse().ok()?;
+    if quota == "max" || period == 0 {
+        return None;
+    }
+    let quota: u64 = quota.parse().ok()?;
+    Some(((quota.saturating_mul(100) / period).max(1)) as u32)
 }
 
 /// xorshift64, only used to break ties between equally quiet peers: a burst of
@@ -1127,11 +1159,10 @@ impl Rng {
 /// request for a marginal gain.
 fn choose(shared: &Shared, src: Ipv4Addr, index: usize, rng: &mut Rng) -> (Target, u16) {
     let local_busy = shared.busy.load(Ordering::Relaxed);
-    let workers = shared.workers.max(1);
-    if local_busy < workers {
+    if local_busy * 100 < shared.capacity {
         return (Target::Local, 0);
     }
-    let local = score(local_busy, workers);
+    let local = score(local_busy, shared.capacity);
     let peers = shared.snapshot();
     if peers.iter().any(|p| p.ip == src) {
         // The request came from another node, so this is already the second
@@ -1139,28 +1170,33 @@ fn choose(shared: &Shared, src: Ipv4Addr, index: usize, rng: &mut Rng) -> (Targe
         // would build a chain and add a hop for every node on the switch.
         return (Target::Local, 0);
     }
-    let mut best = f32::MAX;
-    let mut candidates: Vec<(Ipv4Addr, u16)> = Vec::new();
+    // Every peer that is clearly quieter than this box is a candidate, weighted
+    // by the CPU it can really spend. Sending a whole burst to the single
+    // quietest peer would decide the split before any beacon has reported the
+    // load, so a fast box would take every connection in the burst.
+    let mut total: u64 = 0;
+    let mut picks: Vec<(u64, Ipv4Addr, u16)> = Vec::new();
     for peer in peers.iter() {
         let port = match peer.ports.get(index) {
             Some(p) => *p,
             None => continue,
         };
-        let s = score(peer.busy, peer.workers);
-        if s < best - 0.001 {
-            best = s;
-            candidates.clear();
-            candidates.push((peer.ip, port));
-        } else if (s - best).abs() <= 0.001 {
-            candidates.push((peer.ip, port));
+        if !(score(peer.busy, peer.capacity) * 1.25 < local) {
+            continue;
         }
+        total += peer.capacity.max(1) as u64;
+        picks.push((total, peer.ip, port));
     }
-    if candidates.is_empty() || !(best * 1.25 < local) {
+    if picks.is_empty() {
         return (Target::Local, 0);
     }
-    let pick = (rng.next() % candidates.len() as u64) as usize;
-    let (ip, port) = candidates[pick];
-    (Target::Peer(ip), port)
+    let ticket = rng.next() % total;
+    for (reaches, ip, port) in picks {
+        if ticket < reaches {
+            return (Target::Peer(ip), port);
+        }
+    }
+    (Target::Local, 0)
 }
 
 fn bind_public(port: u16) -> io::Result<RawFd> {
@@ -1395,6 +1431,12 @@ pub fn run(
     } else {
         workers.clamp(1, 128) as u32
     };
+    // What peers should compare against: the CPU this box can really spend,
+    // not the number of threads it happens to run.
+    let capacity = cgroup_capacity()
+        .unwrap_or(worker_count * 100)
+        .min(worker_count * 100)
+        .max(1);
     let sites = web::scan(&root);
     // The same offset the workers were started with, so a second copy on the
     // same machine can serve the same release on a different port set.
@@ -1423,6 +1465,7 @@ pub fn run(
     let shared = Arc::new(Shared {
         node: node.clone(),
         workers: worker_count,
+        capacity,
         control,
         ports: Mutex::new(ports.clone()),
         busy: AtomicU32::new(0),
@@ -1436,10 +1479,12 @@ pub fn run(
     log(
         "ok",
         &format!(
-            "cluster: node {} at {} with {} worker(s), {} site(s) on port(s) {}",
+            "cluster: node {} at {} with {} worker(s) on {}.{:02} core(s) of CPU budget, {} site(s) on port(s) {}",
             node,
             sys::lan_ip(),
             worker_count,
+            capacity / 100,
+            capacity % 100,
             ports.len(),
             ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")
         ),

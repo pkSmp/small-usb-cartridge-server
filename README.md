@@ -94,13 +94,15 @@ That is the whole configuration. Nothing has to be listed, paired or named.
   in about as long as it takes to copy it once.
 - **Load.** `cartridge cluster` owns the public ports and hands each connection
   either to a local worker or to a peer. A connection stays local until the box
-  holds one per core; only then does it go to the peer with the fewest
-  connections per core, and only if that peer is 20 % quieter. A request
-  forwarded in by another box is always answered locally, so two boxes can
-  never bounce one request between them. A burst that arrives between two
-  beacons is spread over the equally quiet peers at random, so one box does not
-  take the whole burst, and if a chosen peer refuses the connection the request
-  is served locally instead of being dropped. The relay is `splice(2)` in both
+  holds one connection per core of budget; only then does it go to a peer that
+  is at least 20 % quieter, measured in connections per core of budget. That
+  budget is the CPU the box may really use, so a container limited to half a
+  core advertises half a core however many workers it starts. A request
+  forwarded in by another box is always answered locally, so two boxes   can never bounce one request between them. A burst that arrives between two
+  beacons is spread over the quieter peers at random, weighted by their budget,
+  so it lands in proportion to what each box can serve instead of on whichever
+  one happens to be quietest, and if a chosen peer refuses the connection the
+  request is served locally instead of being dropped. The relay is `splice(2)` in both
   directions: bytes move from socket to socket through the kernel, costing two
   syscalls per 64 KiB and no copies into user space.
 
@@ -125,6 +127,16 @@ thread PC went from 81,000 rps on a single node to 76,000 with four, and the
 real box stayed at 12,300 both alone and with two fake nodes, because the relay
 is an extra hop that competes for the same cores. The gain comes from separate
 boxes, where each node brings its own cores; that is the case the switch is for.
+
+Mixed hardware, all on one PC: four real userlands in chroots (Ubuntu 24.04,
+Debian 13, Fedora 43, Arch), one worker per core of budget (1, 2, 3, 4 cores),
+and four different release histories - two old releases, one empty store, and
+the newest release on the Arch node only. All four found each other (three
+peers each) and converged on the newest release in one sync round. Straight to
+their workers they measured 84,000 / 141,000 / 119,000 / 135,000 rps. Through
+the slowest node's public port, 16 connections split 1 / 3 / 5 / 7 - in
+proportion to the 1 / 2 / 3 / 4 cores of budget - and 160,000 requests went
+through with no errors at p50 0.38 ms.
 
 ## Where things live
 
