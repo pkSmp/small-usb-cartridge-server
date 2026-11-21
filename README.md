@@ -5,15 +5,15 @@ into the machine and the sites on it appear on your LAN; the server reads the st
 copies the sites into RAM, keeps the sound clips on the stick, rebuilds the boot art
 and speaks optional lines from the cartridge. Unplug it and the last release keeps
 serving. Web server, import, art, sound and status are all one
-0.9 MB executable with **zero dependencies** - not even a crate.
+1.0 MB executable with **zero dependencies** - not even a crate.
 
 > **Built for a fanless Chromebox on a shelf.** This is the whole stack for one
 > machine: an HP Chromebox G2 (2-core Celeron 3865U, 12 GB RAM, Debian 13) driving a
 > TV as the console. It boots in 12.8 s, the web tier idles at ~3 MB RSS, and it
-> serves **18k requests/s on loopback** while doing it. No nginx, no Python, no shell
-> scripts at runtime.
+> serves **55k requests/s on loopback** with a 3.5 ms p99 at 128 connections. No
+> nginx, no Python, no shell scripts at runtime.
 
-![Platform](https://img.shields.io/badge/platform-Linux-lightgrey) ![Runtime](https://img.shields.io/badge/runtime-Rust%20std%20only-orange) ![Binary](https://img.shields.io/badge/binary-0.9%20MB-black) ![Throughput](https://img.shields.io/badge/throughput-18k%20rps-blue)
+![Platform](https://img.shields.io/badge/platform-Linux-lightgrey) ![Runtime](https://img.shields.io/badge/runtime-Rust%20std%20only-orange) ![Binary](https://img.shields.io/badge/binary-1.0%20MB-black) ![Throughput](https://img.shields.io/badge/throughput-55k%20rps-blue)
 
 ---
 ## What it does
@@ -41,6 +41,7 @@ serving. Web server, import, art, sound and status are all one
    install -m 0755 target/release/cartridge /usr/local/bin/cartridge
    install -m 0644 systemd/*.service /etc/systemd/system/
    install -m 0644 systemd/90-cartridge.rules /etc/udev/rules.d/
+   install -m 0644 systemd/99-cartridge-net.conf /etc/sysctl.d/ && sysctl -p /etc/sysctl.d/99-cartridge-net.conf
    systemctl daemon-reload && systemctl enable --now cartridge-web cartridge-console
    ```
 3. **Make a cartridge.** Format a stick as FAT32 or ext4, add a `config.json`, one
@@ -101,26 +102,44 @@ Same machine, same 1360-byte file, before (nginx + Python + shell) and after:
 | Boot to multi-user | 36.0 s | **12.8 s** |
 | Installed packages | 820 | **571** |
 | Web RSS idle | 2.9 MB | 3.0 MB |
-| Loopback rps, 1 connection | 516 | **12,074** |
-| Loopback rps, 100 connections | 10,943 (36 errors) | **17,559** (0) |
-| Loopback rps, 1000 connections | 9,258 (578 errors) | **18,278** (0) |
-| Loopback rps, 5000 connections | 8,473 (3,293 errors) | **17,365** (0) |
-| p99 at 100 connections | 227 ms | **10.7 ms** |
+| Loopback rps, 1 connection | 516 | **29,724** |
+| Loopback rps, 32 connections | 10,943 (36 errors) | **55,372** (0) |
+| Loopback rps, 512 connections | 8,473 (3,293 errors) | **47,558** (0) |
+| p99 at 128 connections | 227 ms | **3.8 ms** |
 | 50 MB download, loopback | 194 MB/s | **1,665 MB/s** |
 
-Over the box's Wi-Fi link the numbers are 7.8k-10k rps, and the 50 MB transfer is
-link-bound at ~16-20 MB/s. Reproduce with `bench/`:
+Serving the same file as the previous build of this server, on the same two cores,
+with the load generator sharing those cores:
+
+| Metric | Previous build | This build |
+|---|---|---|
+| 1 connection | 13,649 rps | **30,696 rps** |
+| 8 connections | 22,401 rps, p99 0.44 ms | **50,509 rps**, p99 0.24 ms |
+| 32 connections | 22,742 rps, p99 1.66 ms | **55,372 rps**, p99 0.83 ms |
+| 128 connections | 24,007 rps, p99 8.45 ms | **52,409 rps**, p99 3.58 ms |
+| 48k misses (404 storm), 32 conns | 3,735 rps, connection closed | **56,532 rps**, kept alive |
+| 1 MB x 50 downloads | 884 MB/s | **939 MB/s** |
+
+Over the box's Wi-Fi link both builds sit at ~1.6k rps with a 4.5 ms p50: the radio,
+not the server, is the limit there, so the gain only appears once a client is fast
+enough to make the box the bottleneck. Reproduce with `bench/`:
 ```
 loadgen bench HOST PORT PATH CONNS REQUESTS
+loadgen sweep HOST PORT PATH MAX_CONNS REQUESTS   # ramps until the knee
 loadgen download HOST PORT PATH [CONNS]
 ```
 
 ## How it works
 
-- **Web tier.** Two worker processes share the port with `SO_REUSEPORT`; each runs an
-  edge-triggered epoll loop, accepts in batches with `accept4`, parses a capped header
-  set, and answers with precomputed headers and `sendfile` from the RAM copy. Bodies
-  are only allocated for error pages. It drops to `nobody` after binding.
+- **Web tier.** One worker per CPU thread (`--workers 0`, the default, is detected at
+  start; this box starts two), each pinned to its own core and sharing the port with
+  `SO_REUSEPORT`, so the kernel spreads connections without a lock. Every worker runs
+  an edge-triggered epoll loop and accepts in batches with `accept4`. A file at or
+  below 256 KiB becomes one finished response in RAM - header, Date hole and body - so
+  a hot request costs a read, a 29-byte Date patch and one `write(2)`, with no `stat`,
+  no `open` and no allocation; a path is trusted for one second before it is checked
+  again, and 404s are cached the same way. Larger files keep the `sendfile` path from
+  the RAM copy. It drops to `nobody` after binding.
 - **Import.** Mounts read-only through the mount syscall, copies the sites into
   `.staging`, then renames into `releases/<timestamp>` and flips a symlink. Old
   releases are pruned. Nothing is written to the stick and no audio is copied.
@@ -140,7 +159,7 @@ loadgen download HOST PORT PATH [CONNS]
 
 | Command | What it does |
 |---|---|
-| `cartridge web [--root DIR] [--workers N]` | serve a directory |
+| `cartridge web [--root DIR] [--workers N]` | serve a directory; `--workers 0` (default) is one per CPU thread |
 | `cartridge import DEVICE` | ingest a stick |
 | `cartridge publish` | copy the live release into RAM |
 | `cartridge status [--watch]` | card, stick, sounds, staging, sites, URLs |
@@ -186,8 +205,11 @@ Honest list, all measured rather than assumed:
   the half blocks to the wrong cells, so the code falls back to `kbd`.
 - **Sound must be WAV.** There is no MP3 decoder; a non-WAV line is skipped and stays
   silent.
-- **No kernel/network sysctl tuning.** Loopback scales to 18k rps on two cores and
-  the Wi-Fi link is the bottleneck, so no unmeasured knobs were added.
+- **The Wi-Fi link, not the server, limits a browser on the network.** Loopback
+  reaches 55k rps on two cores; over the radio the same box answers ~1.6k rps at a
+  4.5 ms p50, which is the access point's latency, not the server's. The only sysctls
+  touched are the four in `systemd/99-cartridge-net.conf` (fast open, listen backlog
+  and TIME_WAIT reuse), each of which was measured here.
 
 ## License
 

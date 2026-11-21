@@ -1,22 +1,33 @@
-//! The web tier: an edge-triggered epoll server, one worker per core, sharing
-//! the ports with SO_REUSEPORT. Bodies leave the machine with sendfile(2);
-//! headers are built once per file and reused; nothing wakes up while idle.
+//! The web tier: an edge-triggered epoll server, one worker per CPU thread,
+//! sharing the ports with SO_REUSEPORT. Small files are kept as complete
+//! responses in RAM and leave the machine with one write(2); larger ones stream
+//! with sendfile(2). Headers are built once per file, the Date line is patched
+//! in place once a second, and path lookups are answered from RAM for a second
+//! at a time, so a hot request costs no syscalls except read and write.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::os::raw::{c_int, c_long, c_void};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const MAX_CONNECTIONS: usize = 4096;
-const READ_BUF: usize = 8192;
+const READ_BUF: usize = 16384;
 const HEADER_CAP: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_REQUESTS: u32 = 1000;
+const MAX_REQUESTS: u32 = 10_000;
+/// Bodies at or below this size are copied into RAM and answered with a single
+/// write; bigger files stream from the page cache with sendfile.
+const RAM_LIMIT: u64 = 256 * 1024;
+/// How long a cached path is trusted without a fresh stat.
+const REVALIDATE: Duration = Duration::from_millis(1000);
+/// "Sun, 06 Nov 1994 08:49:37 GMT"
+const DATE_LEN: usize = 29;
+/// Stop a pathological site from growing one worker's cache without bound.
+const CACHE_ENTRIES: usize = 8192;
 
 extern "C" {
     fn epoll_create1(flags: c_int) -> c_int;
@@ -33,6 +44,7 @@ extern "C" {
     fn setgid(gid: u32) -> c_int;
     fn signal(sig: c_int, handler: usize) -> usize;
     fn geteuid() -> u32;
+    fn sched_setaffinity(pid: c_int, len: usize, mask: *const u8) -> c_int;
 }
 
 // struct epoll_event is packed on x86_64: 4 bytes of events, 8 of data.
@@ -61,6 +73,7 @@ const SO_SNDBUF: c_int = 7;
 const IPPROTO_TCP: c_int = 6;
 const TCP_NODELAY: c_int = 1;
 const TCP_DEFER_ACCEPT: c_int = 9;
+const TCP_FASTOPEN: c_int = 23;
 
 pub struct Site {
     pub port: u16,
@@ -218,47 +231,218 @@ fn decode_path(target: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-// ------------------------------------------------------------- compile-time cache
+// ------------------------------------------------------------------- the clock
 
-struct HeaderSet {
+/// One Date string per second, shared by every response a worker sends. Each
+/// cached response keeps a hole where its Date line belongs; `stamp` remembers
+/// which second is already written into that hole.
+struct Clock {
+    sec: i64,
+    text: [u8; DATE_LEN],
+}
+
+impl Clock {
+    fn new() -> Clock {
+        let mut text = [b' '; DATE_LEN];
+        let sec = crate::sys::now_secs();
+        clock_slot(&mut text, sec);
+        Clock { sec, text }
+    }
+
+    fn tick(&mut self) -> (i64, [u8; DATE_LEN]) {
+        let now = crate::sys::now_secs();
+        if now != self.sec {
+            self.sec = now;
+            clock_slot(&mut self.text, now);
+        }
+        (self.sec, self.text)
+    }
+}
+
+fn clock_slot(text: &mut [u8; DATE_LEN], sec: i64) {
+    let s = http_date(sec);
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(DATE_LEN);
+    text[..n].copy_from_slice(&bytes[..n]);
+}
+
+// ------------------------------------------------------------- in-RAM responses
+
+/// A finished response: header block with a Date hole, optionally the body
+/// appended, so serving it is one slice copy into the connection buffer.
+struct Cached {
+    status: u16,
+    path: PathBuf,
     mtime: i64,
     size: u64,
-    head: Vec<u8>,
-    gz: Option<Vec<u8>>,
-    gz_len: u64,
+    etag: String,
+    stamp: i64,
+    date_off: usize,
+    head_len: usize,
+    checked: Instant,
+    /// Body already lives inside `buf`.
+    in_ram: bool,
+    buf: Vec<u8>,
+    ctype: String,
+    gz: Option<Box<Cached>>,
 }
 
-fn build_head(code: u16, extra_len: Option<u64>, mtime: i64, size: u64, ctype: &str, etag: &str, gz: bool) -> Vec<u8> {
-    let date = http_date(crate::sys::now_secs());
-    let lm = http_date(mtime);
-    let mut head = Vec::with_capacity(320);
-    head.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", code, reason(code)).as_bytes());
-    head.extend_from_slice(b"Server: cartridge\r\n");
-    head.extend_from_slice(format!("Date: {}\r\n", date).as_bytes());
-    head.extend_from_slice(format!("Content-Type: {}\r\n", ctype).as_bytes());
-    head.extend_from_slice(format!("Content-Length: {}\r\n", extra_len.unwrap_or(size)).as_bytes());
-    head.extend_from_slice(format!("Last-Modified: {}\r\n", lm).as_bytes());
-    head.extend_from_slice(format!("ETag: {}\r\n", etag).as_bytes());
-    head.extend_from_slice(b"Accept-Ranges: bytes\r\n");
+fn head_start(code: u16, ctype: &str, length: u64, gz: bool) -> (Vec<u8>, usize) {
+    let mut head = Vec::with_capacity(360);
+    head.extend_from_slice(b"HTTP/1.1 ");
+    head.extend_from_slice(code.to_string().as_bytes());
+    head.push(b' ');
+    head.extend_from_slice(reason(code).as_bytes());
+    head.extend_from_slice(b"\r\nServer: cartridge\r\n");
+    let date_off = head.len() + 6;
+    head.extend_from_slice(b"Date: ");
+    head.extend_from_slice(&[b'-'; DATE_LEN]);
+    head.extend_from_slice(b"\r\n");
+    head.extend_from_slice(b"Content-Type: ");
+    head.extend_from_slice(ctype.as_bytes());
+    head.extend_from_slice(b"\r\nContent-Length: ");
+    head.extend_from_slice(length.to_string().as_bytes());
+    head.extend_from_slice(b"\r\n");
     if gz {
         head.extend_from_slice(b"Content-Encoding: gzip\r\n");
-        head.extend_from_slice(b"Vary: Accept-Encoding\r\n");
     }
-    head.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
-    head
+    (head, date_off)
 }
 
-// --------------------------------------------------------------------- server
+fn head_tail(head: &mut Vec<u8>, mtime: Option<i64>, etag: Option<&str>) {
+    if let Some(m) = mtime {
+        head.extend_from_slice(b"Last-Modified: ");
+        head.extend_from_slice(http_date(m).as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    if let Some(e) = etag {
+        head.extend_from_slice(b"ETag: ");
+        head.extend_from_slice(e.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(
+        b"Accept-Ranges: bytes\r\nVary: Accept-Encoding\r\nConnection: keep-alive\r\n\r\n",
+    );
+}
+
+impl Cached {
+    fn file(path: &Path, mtime: i64, size: u64, ctype: &str, want_gz: bool) -> Cached {
+        let etag = format!("\"{:x}-{:x}\"", mtime.max(0), size);
+        let (mut buf, date_off) = head_start(200, ctype, size, false);
+        head_tail(&mut buf, Some(mtime), Some(&etag));
+        let head_len = buf.len();
+        let mut in_ram = false;
+        if size <= RAM_LIMIT {
+            if let Ok(body) = fs::read(path) {
+                if body.len() as u64 == size {
+                    buf.extend_from_slice(&body);
+                    in_ram = true;
+                }
+            }
+        }
+        Cached {
+            status: 200,
+            path: path.to_path_buf(),
+            mtime,
+            size,
+            etag,
+            stamp: -1,
+            date_off,
+            head_len,
+            checked: Instant::now(),
+            in_ram,
+            buf,
+            ctype: ctype.to_string(),
+            gz: if want_gz { gz_variant(path, mtime, ctype) } else { None },
+        }
+    }
+
+    fn error(code: u16) -> Cached {
+        let body = error_body(code);
+        let ctype = "text/html; charset=utf-8";
+        let (mut buf, date_off) = head_start(code, ctype, body.len() as u64, false);
+        head_tail(&mut buf, None, None);
+        let head_len = buf.len();
+        buf.extend_from_slice(&body);
+        Cached {
+            status: code,
+            path: PathBuf::new(),
+            mtime: 0,
+            size: body.len() as u64,
+            etag: String::new(),
+            stamp: -1,
+            date_off,
+            head_len,
+            checked: Instant::now(),
+            in_ram: true,
+            buf,
+            ctype: ctype.to_string(),
+            gz: None,
+        }
+    }
+}
+
+fn gz_variant(path: &Path, mtime: i64, ctype: &str) -> Option<Box<Cached>> {
+    let candidate = path.with_extension(format!(
+        "{}.gz",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    let meta = fs::metadata(&candidate).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let gz_mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if gz_mtime < mtime {
+        return None;
+    }
+    let size = meta.len();
+    let etag = format!("\"{:x}-{:x}-gz\"", mtime.max(0), size);
+    let (mut buf, date_off) = head_start(200, ctype, size, true);
+    head_tail(&mut buf, Some(mtime), Some(&etag));
+    let head_len = buf.len();
+    let mut in_ram = false;
+    if size <= RAM_LIMIT {
+        if let Ok(body) = fs::read(&candidate) {
+            if body.len() as u64 == size {
+                buf.extend_from_slice(&body);
+                in_ram = true;
+            }
+        }
+    }
+    Some(Box::new(Cached {
+        status: 200,
+        path: candidate,
+        mtime,
+        size,
+        etag,
+        stamp: -1,
+        date_off,
+        head_len,
+        checked: Instant::now(),
+        in_ram,
+        buf,
+        ctype: ctype.to_string(),
+        gz: None,
+    }))
+}
+
+// --------------------------------------------------------------------- conn
 
 struct Listener {
     fd: RawFd,
     root: PathBuf,
-    port: u16,
+    site: usize,
 }
 
 struct Conn {
     fd: RawFd,
     root: PathBuf,
+    site: usize,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
     out_pos: usize,
@@ -272,10 +456,11 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(fd: RawFd, root: PathBuf) -> Conn {
+    fn new(fd: RawFd, root: PathBuf, site: usize) -> Conn {
         Conn {
             fd,
             root,
+            site,
             inbuf: Vec::with_capacity(READ_BUF),
             outbuf: Vec::new(),
             out_pos: 0,
@@ -286,6 +471,56 @@ impl Conn {
             requests: 0,
             deadline: Instant::now() + HEADER_TIMEOUT,
             want_write: false,
+        }
+    }
+
+    fn reset_for_next(&mut self) {
+        // Leftover bytes are the next (pipelined) request; keep them.
+        self.outbuf.clear();
+        self.out_pos = 0;
+        self.file = None;
+        self.file_left = 0;
+        self.requests += 1;
+        self.deadline = Instant::now() + KEEPALIVE_TIMEOUT;
+    }
+
+    fn queue(&mut self, head: Vec<u8>, file: Option<File>, offset: i64, len: u64) {
+        self.outbuf = head;
+        self.out_pos = 0;
+        self.file = file;
+        self.file_off = offset;
+        self.file_left = len;
+    }
+
+    fn simple(&mut self, code: u16, keep: bool, clock: &mut Clock) {
+        let body = if code == 304 { Vec::new() } else { error_body(code) };
+        let (sec, date) = clock.tick();
+        let mut head = Vec::with_capacity(200);
+        head.extend_from_slice(b"HTTP/1.1 ");
+        head.extend_from_slice(code.to_string().as_bytes());
+        head.push(b' ');
+        head.extend_from_slice(reason(code).as_bytes());
+        head.extend_from_slice(b"\r\nServer: cartridge\r\nDate: ");
+        head.extend_from_slice(&date);
+        head.extend_from_slice(b"\r\n");
+        let _ = sec;
+        if code != 304 {
+            head.extend_from_slice(b"Content-Type: text/html; charset=utf-8\r\nContent-Length: ");
+            head.extend_from_slice(body.len().to_string().as_bytes());
+            head.extend_from_slice(b"\r\n");
+        }
+        head.extend_from_slice(if keep {
+            &b"Connection: keep-alive\r\n\r\n"[..]
+        } else {
+            &b"Connection: close\r\n\r\n"[..]
+        });
+        self.outbuf = head;
+        self.outbuf.extend_from_slice(&body);
+        self.out_pos = 0;
+        self.file = None;
+        self.file_left = 0;
+        if !keep {
+            self.closing = true;
         }
     }
 }
@@ -322,291 +557,169 @@ fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
-impl Conn {
-    fn reset_for_next(&mut self) {
-        // Leftover bytes are the next (pipelined) request; keep them.
-        self.outbuf.clear();
-        self.out_pos = 0;
-        self.file = None;
-        self.file_left = 0;
-        self.requests += 1;
-        self.deadline = Instant::now() + KEEPALIVE_TIMEOUT;
+struct Req {
+    head_only: bool,
+    keep: bool,
+    if_none_match: bool,
+    if_modified: Option<i64>,
+    range: Option<(usize, usize)>,
+    accept_gzip: bool,
+}
+
+/// Hand a cached response to the connection: one Date patch, one copy, one
+/// write (or sendfile for a body too big to keep in RAM).
+fn deliver(c: &mut Cached, conn: &mut Conn, req: &Req, clock: &mut Clock) -> bool {
+    let (sec, date) = clock.tick();
+    if c.stamp != sec {
+        c.buf[c.date_off..c.date_off + DATE_LEN].copy_from_slice(&date);
+        c.stamp = sec;
     }
 
-    fn queue(&mut self, head: Vec<u8>, file: Option<File>, offset: i64, len: u64) {
-        self.outbuf = head;
-        self.out_pos = 0;
-        self.file = file;
-        self.file_off = offset;
-        self.file_left = len;
+    if c.status == 304 {
+        conn.simple(304, req.keep, clock);
+        return req.keep;
     }
 
-    fn simple(&mut self, code: u16, keep: bool) {
-        let body = if code == 304 { Vec::new() } else { error_body(code) };
-        let date = http_date(crate::sys::now_secs());
-        let mut head = Vec::with_capacity(200);
-        head.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", code, reason(code)).as_bytes());
-        head.extend_from_slice(b"Server: cartridge\r\n");
-        head.extend_from_slice(format!("Date: {}\r\n", date).as_bytes());
-        if code != 304 {
-            head.extend_from_slice(b"Content-Type: text/html; charset=utf-8\r\n");
-            head.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    if c.status == 200 {
+        if req.if_none_match || date_matches(c, req.if_modified) {
+            conn.simple(304, req.keep, clock);
+            return req.keep;
         }
-        head.extend_from_slice(if keep { &b"Connection: keep-alive\r\n\r\n"[..] } else { &b"Connection: close\r\n\r\n"[..] });
-        self.outbuf = head;
-        self.outbuf.extend_from_slice(&body);
-        self.out_pos = 0;
-        if !keep {
-            self.closing = true;
+        if let Some(range) = req.range {
+            return partial(c, conn, range, req.head_only, clock);
         }
+        if req.accept_gzip {
+            if let Some(gz) = c.gz.as_mut() {
+                return deliver(gz, conn, req, clock);
+            }
+        }
+    }
+
+    conn.outbuf.clear();
+    conn.out_pos = 0;
+    if c.in_ram {
+        conn.file = None;
+        conn.file_left = 0;
+        let end = if req.head_only { c.head_len } else { c.buf.len() };
+        conn.outbuf.extend_from_slice(&c.buf[..end]);
+        return req.keep;
+    }
+    // Too big for RAM: send the header, then stream the file.
+    conn.outbuf.extend_from_slice(&c.buf[..c.head_len]);
+    if req.head_only {
+        conn.file = None;
+        conn.file_left = 0;
+        return req.keep;
+    }
+    match File::open(&c.path) {
+        Ok(f) => {
+            conn.file = Some(f);
+            conn.file_off = 0;
+            conn.file_left = c.size;
+        }
+        Err(_) => {
+            conn.file = None;
+            conn.file_left = 0;
+        }
+    }
+    req.keep
+}
+
+fn partial(
+    c: &Cached,
+    conn: &mut Conn,
+    (start, end): (usize, usize),
+    head_only: bool,
+    clock: &mut Clock,
+) -> bool {
+    let len = end - start + 1;
+    let (sec, date) = clock.tick();
+    let _ = sec;
+    let mut head = Vec::with_capacity(384);
+    head.extend_from_slice(b"HTTP/1.1 206 Partial Content\r\nServer: cartridge\r\nDate: ");
+    head.extend_from_slice(&date);
+    head.extend_from_slice(b"\r\nContent-Type: ");
+    head.extend_from_slice(c.ctype.as_bytes());
+    head.extend_from_slice(b"\r\nContent-Range: bytes ");
+    head.extend_from_slice(start.to_string().as_bytes());
+    head.push(b'-');
+    head.extend_from_slice(end.to_string().as_bytes());
+    head.push(b'/');
+    head.extend_from_slice(c.size.to_string().as_bytes());
+    head.extend_from_slice(b"\r\nContent-Length: ");
+    head.extend_from_slice(len.to_string().as_bytes());
+    head.extend_from_slice(b"\r\nETag: ");
+    head.extend_from_slice(c.etag.as_bytes());
+    head.extend_from_slice(b"\r\nConnection: keep-alive\r\n\r\n");
+    conn.queue(head, None, start as i64, 0);
+    if !head_only {
+        if c.in_ram {
+            conn.outbuf.extend_from_slice(&c.buf[c.head_len + start..c.head_len + end + 1]);
+        } else if let Ok(f) = File::open(&c.path) {
+            conn.file = Some(f);
+            conn.file_off = start as i64;
+            conn.file_left = len as u64;
+        }
+    }
+    true
+}
+
+fn add_epoll(epfd: c_int, fd: RawFd, events: u32, token: u64) {
+    let mut ev = EpollEvent { events, data: token };
+    unsafe {
+        epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut ev);
     }
 }
 
-/// Build the response for one request. Returns true when the connection can
-/// carry another request.
-fn handle_request(conn: &mut Conn, cache: &mut HashMap<PathBuf, HeaderSet>) -> bool {
-    let end = match find_header_end(&conn.inbuf) {
-        Some(e) => e,
-        None => {
-            if conn.inbuf.len() > HEADER_CAP {
-                conn.simple(414, false);
-                return false;
-            }
-            return true;
-        }
-    };
-    let header_text = String::from_utf8_lossy(&conn.inbuf[..end]).to_string();
-    conn.inbuf.drain(..end + 4);
-    let mut lines = header_text.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let target = parts.next().unwrap_or("/");
-    let version = parts.next().unwrap_or("HTTP/1.1");
-    let head_only = method == "HEAD";
-    if method != "GET" && method != "HEAD" {
-        conn.simple(405, false);
-        return false;
+fn mod_epoll(epfd: c_int, fd: RawFd, events: u32, token: u64) {
+    let mut ev = EpollEvent { events, data: token };
+    unsafe {
+        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &mut ev);
     }
-    if target.len() > 4096 {
-        conn.simple(414, false);
-        return false;
-    }
-    let keep = version == "HTTP/1.1"
-        && !header_text
-            .split("\r\n")
-            .any(|l| l.to_ascii_lowercase().starts_with("connection:") && l.to_ascii_lowercase().contains("close"));
+}
 
-    // Conditional and range headers.
-    let mut if_none_match: Option<&str> = None;
-    let mut if_modified: Option<&str> = None;
-    let mut range: Option<&str> = None;
-    let mut accept_gzip = false;
-    for line in lines {
-        let lower = line.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("if-none-match:") {
-            let _ = v;
-            if_none_match = line.split_once(':').map(|(_, v)| v.trim());
-        } else if let Some(_v) = lower.strip_prefix("if-modified-since:") {
-            if_modified = line.split_once(':').map(|(_, v)| v.trim());
-        } else if lower.starts_with("range:") {
-            range = line.split_once(':').map(|(_, v)| v.trim());
-        } else if lower.starts_with("accept-encoding:") {
-            accept_gzip = lower.contains("gzip");
+fn bind_port(port: u16) -> io::Result<c_int> {
+    unsafe {
+        let fd = socket(2, 1 | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
         }
-    }
-
-    let decoded = match decode_path(target) {
-        Some(d) => d,
-        None => {
-            conn.simple(400, false);
-            return false;
+        let one: c_int = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one as *const _ as *const c_void, 4);
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one as *const _ as *const c_void, 4);
+        let sndbuf: c_int = 1 << 20;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf as *const _ as *const c_void, 4);
+        let defer: c_int = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer as *const _ as *const c_void, 4);
+        // Accept the data in the third packet of the handshake: one round trip
+        // saved for every new connection. Ignored when the sysctl is off.
+        let fastopen: c_int = 1024;
+        setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &fastopen as *const _ as *const c_void, 4);
+        #[repr(C)]
+        struct SockAddrIn {
+            family: u16,
+            port: u16,
+            addr: u32,
+            zero: [u8; 8],
         }
-    };
-    if !decoded.starts_with('/') {
-        conn.simple(400, false);
-        return false;
-    }
-    for segment in decoded.split('/') {
-        if (!segment.is_empty() && segment.starts_with('.')) || segment.contains('\0') {
-            conn.simple(403, false);
-            return false;
-        }
-    }
-    let mut path = conn.root.clone();
-    for segment in decoded.split('/').filter(|s| !s.is_empty()) {
-        if segment == ".." {
-            conn.simple(403, false);
-            return false;
-        }
-        path.push(segment);
-    }
-
-    let meta = match fs::metadata(&path) {
-        Ok(m) => m,
-        Err(_) => {
-            conn.simple(404, false);
-            return false;
-        }
-    };
-    if meta.is_dir() {
-        if !decoded.ends_with('/') {
-            let date = http_date(crate::sys::now_secs());
-            let head = format!(
-                "HTTP/1.1 301 Moved Permanently\r\nServer: cartridge\r\nDate: {}\r\nLocation: {}/\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
-                date, decoded
-            );
-            conn.queue(head.into_bytes(), None, 0, 0);
-            return true;
-        }
-        let mut found = None;
-        for name in ["index.html", "index.htm"] {
-            let candidate = path.join(name);
-            if candidate.is_file() {
-                found = Some(candidate);
-                break;
-            }
-        }
-        match found {
-            Some(p) => path = p,
-            None => {
-                conn.simple(403, false);
-                return false;
-            }
-        }
-    }
-
-    let meta = match fs::metadata(&path) {
-        Ok(m) => m,
-        Err(_) => {
-            conn.simple(404, false);
-            return false;
-        }
-    };
-    let size = meta.len();
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let etag = format!("\"{:x}-{:x}\"", mtime.max(0), size);
-
-    if let Some(inm) = if_none_match {
-        if inm.split(',').any(|t| t.trim() == etag)
-            || (if_modified == Some(http_date(mtime).as_str()) && mtime > 0)
-        {
-            conn.simple(304, keep);
-            return keep;
-        }
-    } else if if_modified == Some(http_date(mtime).as_str()) && mtime > 0 {
-        conn.simple(304, keep);
-        return keep;
-    }
-
-    let kind = mime(&path);
-    let ctype = if wants_charset(kind) {
-        format!("{}; charset=utf-8", kind)
-    } else {
-        kind.to_string()
-    };
-
-    // Cached header block, rebuilt when the file changes.
-    let entry = cache.entry(path.clone()).or_insert_with(|| HeaderSet {
-        mtime: -1,
-        size: 0,
-        head: Vec::new(),
-        gz: None,
-        gz_len: 0,
-    });
-    if entry.mtime != mtime || entry.size != size || entry.head.is_empty() {
-        entry.mtime = mtime;
-        entry.size = size;
-        entry.head = build_head(200, None, mtime, size, &ctype, &etag, false);
-        entry.gz = None;
-        entry.gz_len = 0;
-    }
-
-    let gz_candidate = path.with_extension(format!(
-        "{}.gz",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("")
-    ));
-    if accept_gzip && entry.gz.is_none() && gz_candidate.is_file() {
-        if let Ok(gz_file) = File::open(&gz_candidate) {
-            if let Ok(m) = gz_file.metadata() {
-                let gz_mtime = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                if gz_mtime >= mtime {
-                    let gz_etag = format!("\"{:x}-{:x}-gz\"", mtime.max(0), m.len());
-                    entry.gz = Some(build_head(200, None, mtime, m.len(), &ctype, &gz_etag, true));
-                    entry.gz_len = m.len();
-                }
-            }
-        }
-    }
-
-    if let Some((start, end)) = range.and_then(|r| parse_range(r, size)) {
-        let len = end - start + 1;
-        let head = format!(
-            "HTTP/1.1 206 Partial Content\r\nServer: cartridge\r\nDate: {}\r\nContent-Type: {}\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nLast-Modified: {}\r\nETag: {}\r\nAccept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n",
-            http_date(crate::sys::now_secs()),
-            ctype,
-            start,
-            end,
-            size,
-            len,
-            http_date(mtime),
-            etag
-        );
-        let file = match File::open(&path) {
-            Ok(f) => f,
-            Err(_) => {
-                conn.simple(403, false);
-                return false;
-            }
+        let addr = SockAddrIn {
+            family: 2, // AF_INET, host order
+            port: port.to_be(),
+            addr: 0,
+            zero: [0; 8],
         };
-        conn.queue(head.into_bytes(), Some(file), start as i64, if head_only { 0 } else { len });
-        if !head_only {
-            conn.file_left = len;
+        if bind(fd, &addr as *const _ as *const c_void, std::mem::size_of::<SockAddrIn>() as u32) != 0 {
+            let err = io::Error::last_os_error();
+            close(fd);
+            return Err(err);
         }
-        if head_only {
-            conn.file = None;
+        if listen(fd, 4096) != 0 {
+            let err = io::Error::last_os_error();
+            close(fd);
+            return Err(err);
         }
-        return true;
+        Ok(fd)
     }
-
-    // gzip variant when the client asked for it.
-    if accept_gzip {
-        if let Some(head) = &entry.gz {
-            let file = File::open(&gz_candidate).ok();
-            let len = entry.gz_len;
-            let head = head.clone();
-            conn.queue(head, file, 0, if head_only { 0 } else { len });
-            if head_only {
-                conn.file = None;
-            }
-            return true;
-        }
-    }
-
-    let head = entry.head.clone();
-    let file = match File::open(&path) {
-        Ok(f) => f,
-        Err(_) => {
-            conn.simple(403, false);
-            return false;
-        }
-    };
-    conn.queue(head, Some(file), 0, if head_only { 0 } else { size });
-    if head_only {
-        conn.file = None;
-    }
-    let _ = keep;
-    true
 }
 
 fn flush(conn: &mut Conn) -> io::Result<bool> {
@@ -662,61 +775,285 @@ fn flush(conn: &mut Conn) -> io::Result<bool> {
     Ok(true)
 }
 
-fn add_epoll(epfd: c_int, fd: RawFd, events: u32, token: u64) {
-    let mut ev = EpollEvent { events, data: token };
-    unsafe {
-        epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut ev);
+/// Resolve the request path into a file, following the one directory rule the
+/// server has: `/` means `index.html`.
+fn locate(root: &Path, decoded: &str) -> Locate {
+    let mut path = root.to_path_buf();
+    for segment in decoded.split('/').filter(|s| !s.is_empty()) {
+        path.push(segment);
+    }
+    if decoded.ends_with('/') {
+        for name in ["index.html", "index.htm"] {
+            let candidate = path.join(name);
+            if candidate.is_file() {
+                return Locate::File(candidate);
+            }
+        }
+        if path.is_dir() {
+            return Locate::Forbidden;
+        }
+        return Locate::Missing;
+    }
+    match fs::metadata(&path) {
+        Ok(meta) if meta.is_dir() => Locate::Redirect,
+        Ok(_) => Locate::File(path),
+        Err(_) => Locate::Missing,
     }
 }
 
-fn mod_epoll(epfd: c_int, fd: RawFd, events: u32, token: u64) {
-    let mut ev = EpollEvent { events, data: token };
-    unsafe {
-        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &mut ev);
+enum Locate {
+    File(PathBuf),
+    Redirect,
+    Forbidden,
+    Missing,
+}
+
+fn file_stats(path: &Path) -> Option<(i64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some((mtime, meta.len()))
+}
+
+fn if_modified_secs(value: &str) -> Option<i64> {
+    // Only the exact format we emit matters: "Sun, 06 Nov 1994 08:49:37 GMT".
+    let b = value.as_bytes();
+    if b.len() != DATE_LEN {
+        return None;
+    }
+    let day: i64 = value.get(5..7)?.parse().ok()?;
+    let mon = match value.get(8..11)? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = value.get(12..16)?.parse().ok()?;
+    let hour: i64 = value.get(17..19)?.parse().ok()?;
+    let minute: i64 = value.get(20..22)?.parse().ok()?;
+    let second: i64 = value.get(23..25)?.parse().ok()?;
+    let days = days_from_civil(year, mon, day as u32);
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Build the response for one request. Returns true when the connection can
+/// carry another request.
+fn handle_request(
+    conn: &mut Conn,
+    cache: &mut HashMap<String, Cached>,
+    clock: &mut Clock,
+) -> bool {
+    let end = match find_header_end(&conn.inbuf) {
+        Some(e) => e,
+        None => {
+            if conn.inbuf.len() > HEADER_CAP {
+                conn.simple(414, false, clock);
+                return false;
+            }
+            return true;
+        }
+    };
+    let header_text = String::from_utf8_lossy(&conn.inbuf[..end]).to_string();
+    conn.inbuf.drain(..end + 4);
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("/");
+    let version = parts.next().unwrap_or("HTTP/1.1");
+    let head_only = method == "HEAD";
+    if method != "GET" && method != "HEAD" {
+        conn.simple(405, false, clock);
+        return false;
+    }
+    if target.len() > 4096 {
+        conn.simple(414, false, clock);
+        return false;
+    }
+    let mut keep = version == "HTTP/1.1" && !header_text.contains("Connection: close")
+        && !header_text.to_ascii_lowercase().contains("connection: close");
+    if version != "HTTP/1.1" {
+        keep = false;
+    }
+
+    let mut if_none_match_etag: Option<&str> = None;
+    let mut if_modified_raw: Option<&str> = None;
+    let mut range_raw: Option<&str> = None;
+    let mut accept_gzip = false;
+    for line in lines {
+        let lower = line.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("if-none-match:") {
+            let _ = v;
+            if_none_match_etag = line.split_once(':').map(|(_, v)| v.trim());
+        } else if let Some(_v) = lower.strip_prefix("if-modified-since:") {
+            if_modified_raw = line.split_once(':').map(|(_, v)| v.trim());
+        } else if lower.starts_with("range:") {
+            range_raw = line.split_once(':').map(|(_, v)| v.trim());
+        } else if lower.starts_with("accept-encoding:") {
+            accept_gzip = lower.contains("gzip");
+        }
+    }
+
+    let decoded = match decode_path(target) {
+        Some(d) => d,
+        None => {
+            conn.simple(400, false, clock);
+            return false;
+        }
+    };
+    if !decoded.starts_with('/') {
+        conn.simple(400, false, clock);
+        return false;
+    }
+    for segment in decoded.split('/') {
+        if (!segment.is_empty() && segment.starts_with('.')) || segment.contains('\0') {
+            conn.simple(403, false, clock);
+            return false;
+        }
+    }
+
+    // Hot path: the same path inside the last second, already a finished
+    // response, no stat and no file lookup.
+    let fresh = match cache.get(decoded.as_str()) {
+        Some(c) => c.checked.elapsed() < REVALIDATE,
+        None => false,
+    };
+    if fresh {
+        let c = cache.get_mut(decoded.as_str()).unwrap();
+        let req = build_req(c, head_only, keep, if_none_match_etag, if_modified_raw, range_raw, accept_gzip);
+        return deliver(c, conn, &req, clock);
+    }
+
+    let entry = match locate(&conn.root, &decoded) {
+        Locate::File(path) => {
+            let (mtime, size) = match file_stats(&path) {
+                Some(s) => s,
+                None => return deliver_error(conn, cache, decoded, 404, clock),
+            };
+            match cache.get_mut(decoded.as_str()) {
+                Some(c) if c.status == 200 && c.mtime == mtime && c.size == size => {
+                    c.checked = Instant::now();
+                    if accept_gzip && c.gz.is_none() {
+                        let ctype = content_type(&path);
+                        c.gz = gz_variant(&path, mtime, &ctype);
+                    }
+                    None
+                }
+                _ => {
+                    let ctype = content_type(&path);
+                    let c = Cached::file(&path, mtime, size, &ctype, accept_gzip);
+                    Some((decoded.clone(), c))
+                }
+            }
+        }
+        Locate::Redirect => {
+            let mut head = Vec::with_capacity(240);
+            head.extend_from_slice(b"HTTP/1.1 301 Moved Permanently\r\nServer: cartridge\r\n");
+            let date_off = head.len() + 6;
+            head.extend_from_slice(b"Date: ");
+            head.extend_from_slice(&[b'-'; DATE_LEN]);
+            head.extend_from_slice(b"\r\nLocation: ");
+            head.extend_from_slice(decoded.as_bytes());
+            head.extend_from_slice(b"/\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+            let (sec, date) = clock.tick();
+            head[date_off..date_off + DATE_LEN].copy_from_slice(&date);
+            let _ = sec;
+            conn.queue(head, None, 0, 0);
+            return keep;
+        }
+        Locate::Forbidden => Some((decoded.clone(), Cached::error(403))),
+        Locate::Missing => Some((decoded.clone(), Cached::error(404))),
+    };
+
+    if let Some((key, c)) = entry {
+        if cache.len() >= CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key, c);
+    }
+    let c = cache.get_mut(decoded.as_str()).unwrap();
+    let req = build_req(c, head_only, keep, if_none_match_etag, if_modified_raw, range_raw, accept_gzip);
+    deliver(c, conn, &req, clock)
+}
+
+fn deliver_error(
+    conn: &mut Conn,
+    cache: &mut HashMap<String, Cached>,
+    decoded: String,
+    code: u16,
+    clock: &mut Clock,
+) -> bool {
+    let keep = true;
+    if cache.len() >= CACHE_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(decoded.clone(), Cached::error(code));
+    let c = cache.get_mut(decoded.as_str()).unwrap();
+    let req = Req { head_only: false, keep, if_none_match: false, if_modified: None, range: None, accept_gzip: false };
+    deliver(c, conn, &req, clock)
+}
+
+fn content_type(path: &Path) -> String {
+    let kind = mime(path);
+    if wants_charset(kind) {
+        format!("{}; charset=utf-8", kind)
+    } else {
+        kind.to_string()
     }
 }
 
-fn bind_port(port: u16) -> io::Result<c_int> {
-    unsafe {
-        let fd = socket(2, 1 | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let one: c_int = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one as *const _ as *const c_void, 4);
-        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one as *const _ as *const c_void, 4);
-        let sndbuf: c_int = 1 << 20;
-        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf as *const _ as *const c_void, 4);
-        let defer: c_int = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer as *const _ as *const c_void, 4);
-        #[repr(C)]
-        struct SockAddrIn {
-            family: u16,
-            port: u16,
-            addr: u32,
-            zero: [u8; 8],
-        }
-        let addr = SockAddrIn {
-            family: 2, // AF_INET, host order
-            port: port.to_be(),
-            addr: 0,
-            zero: [0; 8],
-        };
-        if bind(fd, &addr as *const _ as *const c_void, std::mem::size_of::<SockAddrIn>() as u32) != 0 {
-            let err = io::Error::last_os_error();
-            close(fd);
-            return Err(err);
-        }
-        if listen(fd, 4096) != 0 {
-            let err = io::Error::last_os_error();
-            close(fd);
-            return Err(err);
-        }
-        Ok(fd)
-    }
+fn build_req(
+    c: &Cached,
+    head_only: bool,
+    keep: bool,
+    inm: Option<&str>,
+    if_modified: Option<&str>,
+    range: Option<&str>,
+    accept_gzip: bool,
+) -> Req {
+    let if_none_match = match inm {
+        Some(v) => v.split(',').any(|t| t.trim() == c.etag),
+        None => false,
+    };
+    let if_modified = match if_modified.and_then(if_modified_secs) {
+        Some(t) => Some(t),
+        None => None,
+    };
+    let range = range.and_then(|r| parse_range(r, c.size)).map(|(s, e)| (s as usize, e as usize));
+    Req { head_only, keep, if_none_match, if_modified, range, accept_gzip }
 }
 
-fn worker(listeners: Vec<Listener>) {
+fn date_matches(c: &Cached, if_modified: Option<i64>) -> bool {
+    matches!(if_modified, Some(t) if t == c.mtime && c.mtime > 0)
+}
+
+fn worker(listeners: Vec<Listener>, slot: usize) {
     let epfd = unsafe { epoll_create1(SOCK_CLOEXEC) };
     if epfd < 0 {
         eprintln!("cartridge web: epoll_create1 failed");
@@ -726,10 +1063,13 @@ fn worker(listeners: Vec<Listener>) {
         add_epoll(epfd, l.fd, EPOLLIN | EPOLLET, (l.fd as u64) << 1);
     }
 
+    let sites = listeners.len();
     let mut conns: HashMap<RawFd, Conn> = HashMap::new();
-    let mut cache: HashMap<PathBuf, HeaderSet> = HashMap::new();
-    let mut events = vec![EpollEvent { events: 0, data: 0 }; 256];
+    let mut caches: Vec<HashMap<String, Cached>> = (0..sites).map(|_| HashMap::new()).collect();
+    let mut clock = Clock::new();
+    let mut events = vec![EpollEvent { events: 0, data: 0 }; 512];
     let mut next_sweep = Instant::now() + Duration::from_secs(1);
+    let _ = slot;
 
     loop {
         // epoll_wait must block indefinitely unless a connection has a deadline.
@@ -762,8 +1102,14 @@ fn worker(listeners: Vec<Listener>) {
             if token & 1 == 0 {
                 // Listener: accept a batch.
                 let fd = (token >> 1) as RawFd;
+                let listener = match listeners.iter().find(|l| l.fd == fd) {
+                    Some(l) => l,
+                    None => continue,
+                };
                 loop {
-                    let client = unsafe { accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), SOCK_NONBLOCK | SOCK_CLOEXEC) };
+                    let client = unsafe {
+                        accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), SOCK_NONBLOCK | SOCK_CLOEXEC)
+                    };
                     if client < 0 {
                         break;
                     }
@@ -775,15 +1121,12 @@ fn worker(listeners: Vec<Listener>) {
                         unsafe { close(client) };
                         break;
                     }
-                    let root = listeners
-                        .iter()
-                        .find(|l| l.fd == fd)
-                        .map(|l| l.root.clone())
-                        .unwrap_or_default();
                     let token = (client as u64) << 1 | 1;
                     add_epoll(epfd, client, EPOLLIN | EPOLLRDHUP | EPOLLET, token);
-                    conns.insert(client, Conn::new(client, root));
-                    let _ = client;
+                    conns.insert(
+                        client,
+                        Conn::new(client, listener.root.clone(), listener.site),
+                    );
                 }
             } else {
                 let fd = (token >> 1) as RawFd;
@@ -823,8 +1166,9 @@ fn worker(listeners: Vec<Listener>) {
                     }
                     // Process requests while there is a complete one buffered.
                     if !drop_conn {
+                        let cache = &mut caches[conn.site];
                         while find_header_end(&conn.inbuf).is_some() {
-                            let keep = handle_request(conn, &mut cache);
+                            let keep = handle_request(conn, cache, &mut clock);
                             match flush(conn) {
                                 Ok(done) => {
                                     if !done {
@@ -853,8 +1197,9 @@ fn worker(listeners: Vec<Listener>) {
                             Ok(done) => {
                                 if done && conn.file_left == 0 && conn.out_pos >= conn.outbuf.len() {
                                     // Response finished; handle pipelined input.
+                                    let cache = &mut caches[conn.site];
                                     while find_header_end(&conn.inbuf).is_some() {
-                                        let keep = handle_request(conn, &mut cache);
+                                        let keep = handle_request(conn, cache, &mut clock);
                                         match flush(conn) {
                                             Ok(true) => {}
                                             Ok(false) => break,
@@ -922,15 +1267,38 @@ extern "C" fn on_hup(_: c_int) {
     unsafe { _exit(0) }
 }
 
-static RELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Pin a worker to one CPU so its response cache stays in that core's L2.
+fn pin(slot: usize, cpus: usize) {
+    if cpus <= 1 {
+        return;
+    }
+    let cpu = slot % cpus;
+    let mut set = [0u8; 128];
+    set[cpu / 8] |= 1 << (cpu % 8);
+    unsafe {
+        sched_setaffinity(0, 128, set.as_ptr());
+    }
+}
 
-/// Serve every site under `root`. Two workers bind the same ports with
-/// SO_REUSEPORT; the kernel spreads connections between them.
+/// CPU threads this machine can actually run: no point starting more workers
+/// than there are hardware threads, and no point using fewer.
+pub fn cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(1, 128)
+}
+
+/// Serve every site under `root`. One worker per CPU thread binds the same
+/// ports with SO_REUSEPORT; the kernel spreads connections between them.
 pub fn run(root: PathBuf, offset: u16, workers: usize) -> Result<(), String> {
     unsafe {
         signal(1, on_hup as usize);
     }
     let _ = fs::write("/run/cartridge-web.pid", format!("{}\n", std::process::id()));
+
+    let cpus = cpu_count();
+    let workers = if workers == 0 { cpus } else { workers.clamp(1, 128) };
 
     let mut sites = scan(&root);
     for site in sites.iter_mut() {
@@ -944,32 +1312,40 @@ pub fn run(root: PathBuf, offset: u16, workers: usize) -> Result<(), String> {
     // Bind every worker's listeners before giving up root: SO_REUSEPORT lets
     // each worker own its own socket on the same port.
     let mut sets: Vec<Vec<Listener>> = Vec::new();
-    for id in 0..workers.max(1) {
+    for id in 0..workers {
         let mut ls = Vec::new();
-        for (port, root) in &pairs {
+        for (site, (port, root)) in pairs.iter().enumerate() {
             match bind_port(*port) {
                 Ok(fd) => {
                     if id == 0 {
                         eprintln!("cartridge web: listening on {}", port);
                     }
-                    ls.push(Listener { fd, root: root.clone(), port: *port });
+                    ls.push(Listener { fd, root: root.clone(), site });
                 }
                 Err(e) => eprintln!("cartridge web: cannot listen on {}: {}", port, e),
             }
         }
         sets.push(ls);
     }
+    eprintln!(
+        "cartridge web: {} worker(s) on {} CPU(s), {} site(s) from RAM",
+        workers, cpus, pairs.len()
+    );
 
     drop_privileges();
 
     let mut sets = sets.into_iter();
     let first = sets.next().unwrap_or_default();
     let mut handles = Vec::new();
-    for ls in sets {
-        handles.push(std::thread::spawn(move || worker(ls)));
+    for (i, ls) in sets.enumerate() {
+        let slot = i + 1;
+        handles.push(std::thread::spawn(move || {
+            pin(slot, cpus);
+            worker(ls, slot)
+        }));
     }
-    worker(first);
-    let _ = RELOAD;
+    pin(0, cpus);
+    worker(first, 0);
     for h in handles {
         let _ = h.join();
     }

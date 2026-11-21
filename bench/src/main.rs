@@ -73,7 +73,7 @@ fn read_response(reader: &mut BufReader<TcpStream>) -> Result<(usize, usize), St
     Ok((status, body_len))
 }
 
-fn bench(host: &str, port: u16, path: &str, conns: usize, requests: usize) {
+fn bench(host: &str, port: u16, path: &str, conns: usize, requests: usize) -> f64 {
     let barrier = Arc::new(Barrier::new(conns + 1));
     let mut handles = Vec::with_capacity(conns);
     let start_all = Instant::now();
@@ -145,7 +145,7 @@ fn bench(host: &str, port: u16, path: &str, conns: usize, requests: usize) {
     };
     let rps = all.len() as f64 / elapsed.as_secs_f64();
     println!(
-        "conns={} reqs/conn={} ok={} errors={} time={:.2}s rps={:.0} p50={:.2}ms p99={:.2}ms",
+        "conns={} reqs/conn={} ok={} errors={} time={:.2}s rps={:.0} p50={:.2}ms p95={:.2}ms p99={:.2}ms p999={:.2}ms",
         conns,
         requests,
         all.len(),
@@ -153,8 +153,28 @@ fn bench(host: &str, port: u16, path: &str, conns: usize, requests: usize) {
         elapsed.as_secs_f64(),
         rps,
         pct(0.50),
-        pct(0.99)
+        pct(0.95),
+        pct(0.99),
+        pct(0.999)
     );
+    rps
+}
+
+/// Ramps the connection count to find the knee: the point where latency rises
+/// faster than throughput. Stops early when the server starts refusing.
+fn sweep(host: &str, port: u16, path: &str, max_conns: usize, requests: usize) {
+    let mut conns = 1;
+    let mut best = 0.0f64;
+    while conns <= max_conns {
+        let rps = bench(host, port, path, conns, requests);
+        if rps <= 0.0 {
+            println!("sweep: stopped at {} connections (no completions)", conns);
+            break;
+        }
+        best = best.max(rps);
+        conns *= 2;
+    }
+    println!("sweep: peak {:.0} rps", best);
 }
 
 fn download(host: &str, port: u16, path: &str, conns: usize) {
@@ -220,6 +240,12 @@ fn main() {
             let conns: usize = args[5].parse().expect("conns");
             let requests: usize = args.get(6).and_then(|v| v.parse().ok()).unwrap_or(100);
             bench(&args[2], port, &args[4], conns, requests);
+        }
+        "sweep" => {
+            let port: u16 = args[3].parse().expect("port");
+            let max_conns: usize = args.get(5).and_then(|v| v.parse().ok()).unwrap_or(256);
+            let requests: usize = args.get(6).and_then(|v| v.parse().ok()).unwrap_or(2000);
+            sweep(&args[2], port, &args[4], max_conns, requests);
         }
         "download" => {
             let port: u16 = args[3].parse().expect("port");

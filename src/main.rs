@@ -34,7 +34,7 @@ fn usage() -> ! {
         "usage: cartridge <command>\n\
          \n\
          commands:\n\
-         \x20 web [--root DIR] [--offset N]   serve the cartridge sites\n\
+         \x20 web [--root DIR] [--offset N] [--workers N]   serve the cartridge sites\n\
          \x20 publish                        copy the live release into RAM\n\
          \x20 import DEVICE                  ingest a cartridge\n\
          \x20 status [--watch]               report what the machine sees\n\
@@ -219,7 +219,7 @@ fn run_art(args: &[String]) -> Result<i32, String> {
 fn run_web(args: &[String]) -> Result<i32, String> {
     let mut root = PathBuf::from("/run/cartridge");
     let mut offset: u16 = 0;
-    let mut workers: usize = 2;
+    let mut workers: usize = 0; // 0 = one worker per CPU thread
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -237,7 +237,7 @@ fn run_web(args: &[String]) -> Result<i32, String> {
             }
             "--workers" => {
                 if let Some(v) = args.get(i + 1) {
-                    workers = v.parse().unwrap_or(2).max(1);
+                    workers = v.parse().unwrap_or(0).min(128);
                 }
                 i += 2;
             }
