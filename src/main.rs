@@ -9,6 +9,7 @@
 
 mod art;
 mod bootart;
+mod cluster;
 mod console;
 mod font;
 mod hash;
@@ -31,7 +32,8 @@ fn usage() -> ! {
         "usage: cartridge <command>\n\
          \n\
          commands:\n\
-         \x20 web [--root DIR] [--offset N] [--workers N]   serve the cartridge sites\n\
+         \x20 web [--root DIR] [--offset N] [--workers N] [--bind ADDR]   serve the cartridge sites\n\
+         \x20 cluster [--root DIR] [--name ID]   share sites and load with the boxes on the switch\n\
          \x20 publish                        copy the live release into RAM\n\
          \x20 import DEVICE                  ingest a cartridge\n\
          \x20 status [--watch]               report what the machine sees\n\
@@ -55,6 +57,7 @@ fn main() -> ExitCode {
     let result = match args[1].as_str() {
         "art" => run_art(&args[2..]),
         "web" => run_web(&args[2..]),
+        "cluster" => run_cluster(&args[2..]),
         "publish" => publish::run(),
         "import" => run_import(&args[2..]),
         "status" => status::run(args[2..].iter().any(|a| a == "--watch" || a == "-w")),
@@ -142,6 +145,7 @@ fn run_web(args: &[String]) -> Result<i32, String> {
     let mut root = PathBuf::from("/run/cartridge");
     let mut offset: u16 = 0;
     let mut workers: usize = 0; // 0 = one worker per CPU thread
+    let mut bind = [0u8; 4];
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -163,10 +167,65 @@ fn run_web(args: &[String]) -> Result<i32, String> {
                 }
                 i += 2;
             }
+            "--bind" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<std::net::Ipv4Addr>() {
+                        Ok(ip) => bind = ip.octets(),
+                        Err(_) => {
+                            return Err(format!("web: {:?} is not an IPv4 address", v));
+                        }
+                    }
+                }
+                i += 2;
+            }
             _ => i += 1,
         }
     }
-    web::run(root, offset, workers)?;
+    web::run(root, offset, workers, bind)?;
+    Ok(0)
+}
+
+fn run_cluster(args: &[String]) -> Result<i32, String> {
+    let mut root = PathBuf::from("/run/cartridge");
+    let mut control = cluster::DEFAULT_CONTROL;
+    let mut beacon = cluster::DEFAULT_BEACON;
+    let mut workers: usize = 0;
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" => {
+                if let Some(v) = args.get(i + 1) {
+                    root = PathBuf::from(v);
+                }
+                i += 2;
+            }
+            "--control" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    control = v;
+                }
+                i += 2;
+            }
+            "--beacon" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    beacon = v;
+                }
+                i += 2;
+            }
+            "--workers" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    workers = v;
+                }
+                i += 2;
+            }
+            "--name" => {
+                name = args.get(i + 1).cloned();
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    cluster::run(root, control, beacon, workers, name)?;
     Ok(0)
 }
 

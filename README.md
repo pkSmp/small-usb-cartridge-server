@@ -24,6 +24,7 @@ keeps serving. Web server, import, art and status are all one
 | **Folders are ports** | `3000/` becomes `http://host:3000/`, and a root `index.html` becomes port 80. No config needed. |
 | **Boot art** | `boot.png` is converted to coloured half-block cells (two source rows per cell). A picture bigger than the console is shrunk to the largest size that still fits, keeping its shape and leaving rows for the report below, so any image size works; 1, 2, 4 and 8 bit PNGs are read. Near-black pixels are left blank (grey and dark grey are kept), near-identical shades are merged, and up to 15 non-black palette colours are used. |
 | **No wasted writes** | Files whose name and SHA-256 already match the running release are hard-linked into the new release instead of being written again. Replaying the same stick writes 0 bytes. |
+| **Cluster mode** | Several boxes on the same switch act as one: each broadcasts what it serves and how busy it is, copies a new release from a peer within seconds, and takes the load off a node that already has a connection per core - relayed with `splice(2)`, so the bytes never leave the kernel. |
 | **Live status screen** | Under the art: the Markdown site table, the machine and staging facts, and the newest import and boot messages as plain text, redrawn four times a second so a line appears as it is logged. Big text uses the brightest colour from the art; small labels use a reserved bright red so they stay readable, falling back to a saturated red or green from the art when no palette slot is free. Storage reports the internal filesystem's actual used and free space, so the OS, the server binary and every installed program are included; the removable cartridge is never counted. |
 
 ## Setup (5 minutes)
@@ -65,11 +66,58 @@ The folders are the configuration: a numeric folder name is the port. A stick wi
 The server stages the sites into RAM automatically; there are no `ram_mb` or
 `storage_mb` limits to configure.
 
+## Cluster mode
+
+Several of these boxes on one switch behave as a single server: insert the
+cartridge in one and every box serves it, and no box is asked for more than it
+can answer at full speed.
+
+```
+echo CARTRIDGE_BIND=127.0.0.1 > /etc/default/cartridge   # workers go on loopback
+systemctl daemon-reload
+systemctl enable --now cartridge-cluster
+systemctl restart cartridge-web
+```
+
+That is the whole configuration. Nothing has to be listed, paired or named.
+
+- **Discovery.** Each box broadcasts twice a second on UDP 29700: node id, the
+  live release, a fingerprint of that release's content, its worker count and
+  how many connections it is serving. A peer that goes quiet for four seconds
+  drops off the list. Nothing outside the switch is involved.
+- **Sync.** Every two seconds, a box with an older release asks the peer with
+  the newest one for its manifest over TCP 29701, and pulls only files whose
+  SHA-256 it does not already hold; files it does hold are hard-linked, not
+  copied. Checked bytes land in `releases/<timestamp>`, which becomes `live`
+  and is staged into RAM exactly as an import is. A second sync of the same
+  cartridge transfers nothing, so a stick inserted in one box is on all of them
+  in about as long as it takes to copy it once.
+- **Load.** `cartridge cluster` owns the public ports and hands each connection
+  either to a local worker or to a peer. A connection stays local until the box
+  holds one per core; only then does it go to the peer with the fewest
+  connections per core, and only if that peer is 20 % quieter. A request
+  forwarded in by another box is always answered locally, so two boxes can
+  never bounce one request between them. The relay is `splice(2)` in both
+  directions: bytes move from socket to socket through the kernel, costing two
+  syscalls per 64 KiB and no copies into user space.
+
+`cartridge status` and the console show the peers, which of them serve the same
+release, and how much of the load this box took.
+
+What the relay costs, measured on this box with the balancer in front of two
+workers and no peers: **30,060 rps** (p50 0.52 ms at 16 connections, 1.07 ms at
+32) against **54,948 rps** straight to the workers (p50 0.58 ms). Two more
+sockets per request halve the ceiling; a second box on the switch more than
+makes that back, and a page view never notices half a millisecond. A box that
+has nobody to share with can be run without the daemon, serving its ports
+directly as before.
+
 ## Where things live
 
 ```
 src/                     the whole server, module per job
   web.rs                 epoll + SO_REUSEPORT + sendfile file server
+  cluster.rs             beacon, release sync, splice load balancer
   import.rs              mount, validate, publish
   publish.rs             copy the live release into RAM
   machine.rs             RAM, internal disks and staging facts
@@ -145,7 +193,8 @@ loadgen download HOST PORT PATH [CONNS]
 
 | Command | What it does |
 |---|---|
-| `cartridge web [--root DIR] [--workers N]` | serve a directory; `--workers 0` (default) is one per CPU thread |
+| `cartridge web [--root DIR] [--workers N] [--bind ADDR]` | serve a directory; `--workers 0` (default) is one per CPU thread, `--bind 127.0.0.1` keeps the ports for the cluster daemon |
+| `cartridge cluster [--root DIR] [--name ID]` | find the boxes on the switch, keep one release between them, split the load |
 | `cartridge import DEVICE` | ingest a stick |
 | `cartridge publish` | copy the live release into RAM |
 | `cartridge status [--watch]` | machine, stick, staging, sites, URLs |
@@ -176,6 +225,13 @@ loadgen download HOST PORT PATH [CONNS]
 ## Limitations
 
 Honest list, all measured rather than assumed:
+
+- **Cluster mode trusts the clocks.** Releases are ordered by the timestamp in
+  their name, so a box whose clock is badly behind will not adopt a newer
+  release; `cartridge status` shows the peers that disagree. Two boxes that both
+  hold content published in the same second keep their own copy instead of
+  guessing which is right. Run NTP on the boxes; the sync copies sites but not
+  `boot.png`, because the art is each machine's own screen.
 
 - **The console font is still loaded by `setfont`.** The kernel refuses the
   `KDFONTOP` unicode-table ioctls here (`EINVAL`), and glyphs without the table map

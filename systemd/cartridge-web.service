@@ -6,8 +6,12 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# 0.0.0.0 serves the LAN directly. In cluster mode set CARTRIDGE_BIND=127.0.0.1
+# in /etc/default/cartridge, so cartridge-cluster owns the public ports.
+Environment=CARTRIDGE_BIND=0.0.0.0
+EnvironmentFile=-/etc/default/cartridge
 # --workers 0 means one worker per CPU thread, detected at start.
-ExecStart=/usr/local/bin/cartridge web --root /run/cartridge --workers 0
+ExecStart=/usr/local/bin/cartridge web --root /run/cartridge --workers 0 --bind ${CARTRIDGE_BIND}
 Restart=always
 RestartSec=1
 LimitNOFILE=65535

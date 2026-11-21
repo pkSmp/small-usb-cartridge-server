@@ -259,6 +259,36 @@ fn recent_messages(theme: &crate::theme::Theme, cols: usize) -> Vec<String> {
     out
 }
 
+/// One line about the cluster, when the daemon is running: how many boxes are
+/// on the switch, how many serve this release, and where the load went.
+fn cluster_line(theme: &crate::theme::Theme) -> Option<String> {
+    use crate::theme::Role;
+    let state = crate::cluster::state()?;
+    let num = |k: &str| state.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    let mut peers = 0usize;
+    let mut synced = 0usize;
+    if let Some(list) = state.get("peers").and_then(|v| v.as_arr()) {
+        peers = list.len();
+        for peer in list {
+            if peer.get("in_sync").and_then(|v| v.as_bool()).unwrap_or(false) {
+                synced += 1;
+            }
+        }
+    }
+    let fleet = if peers == 0 {
+        "alone on the switch".to_string()
+    } else {
+        format!("{} peer(s), {} in sync", peers, synced)
+    };
+    Some(format!(
+        "{}  {}  {}  {}",
+        theme.paint(Role::Dim, "cluster"),
+        theme.paint(Role::Text, &fleet),
+        theme.paint(Role::Text, &format!("{} here", num("busy"))),
+        theme.paint(Role::Accent, &format!("{} forwarded", num("forwarded")))
+    ))
+}
+
 /// The expensive part of the report: a recursive size walk per site. It is
 /// reused until the live release changes, or for ten seconds at most.
 struct Sites {
@@ -343,6 +373,9 @@ fn draw_status(cache: &mut Option<Sites>, refresh: bool) {
         theme.paint(Role::Dim, "machine"),
         theme.paint(Role::Text, &machine::summary())
     ));
+    if let Some(line) = cluster_line(&theme) {
+        block.push(line);
+    }
 
     // Fill what is left with the newest messages, oldest at the top. A line
     // appears on the next redraw, so the screen keeps up with the import.

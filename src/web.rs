@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
+use std::net::Ipv4Addr;
 use std::os::raw::{c_int, c_long, c_void};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -678,7 +679,7 @@ fn mod_epoll(epfd: c_int, fd: RawFd, events: u32, token: u64) {
     }
 }
 
-fn bind_port(port: u16) -> io::Result<c_int> {
+fn bind_port(port: u16, bind_addr: [u8; 4]) -> io::Result<c_int> {
     unsafe {
         let fd = socket(2, 1 | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if fd < 0 {
@@ -705,7 +706,7 @@ fn bind_port(port: u16) -> io::Result<c_int> {
         let addr = SockAddrIn {
             family: 2, // AF_INET, host order
             port: port.to_be(),
-            addr: 0,
+            addr: u32::from_ne_bytes(bind_addr),
             zero: [0; 8],
         };
         if bind(fd, &addr as *const _ as *const c_void, std::mem::size_of::<SockAddrIn>() as u32) != 0 {
@@ -1290,8 +1291,15 @@ pub fn cpu_count() -> usize {
 }
 
 /// Serve every site under `root`. One worker per CPU thread binds the same
-/// ports with SO_REUSEPORT; the kernel spreads connections between them.
-pub fn run(root: PathBuf, offset: u16, workers: usize) -> Result<(), String> {
+/// ports with SO_REUSEPORT; the kernel spreads connections between them. The
+/// bind address is loopback in cluster mode, where a balancer owns the public
+/// ports and hands work to these workers.
+pub fn run(
+    root: PathBuf,
+    offset: u16,
+    workers: usize,
+    bind_addr: [u8; 4],
+) -> Result<(), String> {
     unsafe {
         signal(1, on_hup as usize);
     }
@@ -1315,10 +1323,14 @@ pub fn run(root: PathBuf, offset: u16, workers: usize) -> Result<(), String> {
     for id in 0..workers {
         let mut ls = Vec::new();
         for (site, (port, root)) in pairs.iter().enumerate() {
-            match bind_port(*port) {
+            match bind_port(*port, bind_addr) {
                 Ok(fd) => {
                     if id == 0 {
-                        eprintln!("cartridge web: listening on {}", port);
+                        eprintln!(
+                            "cartridge web: listening on {}:{}",
+                            Ipv4Addr::from(bind_addr),
+                            port
+                        );
                     }
                     ls.push(Listener { fd, root: root.clone(), site });
                 }

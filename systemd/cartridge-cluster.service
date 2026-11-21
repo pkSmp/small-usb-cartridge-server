@@ -1,0 +1,23 @@
+[Unit]
+Description=Cartridge cluster - share releases and load with the boxes on the switch
+After=network-online.target local-fs.target cartridge-web.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The web tier binds 127.0.0.1 (CARTRIDGE_BIND in /etc/default/cartridge); this
+# process owns the public ports, relays what it cannot serve best locally, and
+# writes a release it pulls from a peer.
+# It exits on purpose when a new cartridge changes the port set.
+ExecStart=/usr/local/bin/cartridge cluster
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+# Requests matter more than anything else the box might be doing.
+Nice=-10
+CPUWeight=10000
+ProtectSystem=full
+ReadWritePaths=/srv/cartridge /run /var/log/cartridge /var/lib/cartridge
+
+[Install]
+WantedBy=multi-user.target

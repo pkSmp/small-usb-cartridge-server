@@ -415,6 +415,68 @@ fn serving_block(o: &Out) {
     }
 }
 
+/// What the cluster daemon reports: this node, the peers on the switch, and how
+/// the load is being shared right now. Silent when cluster mode is off.
+fn cluster_block(o: &Out) {
+    let state = match crate::cluster::state() {
+        Some(v) => v,
+        None => return,
+    };
+    let text = |k: &str| state.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let num = |k: &str| state.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    o.head("cluster");
+    let release = text("release");
+    o.kv(
+        "node",
+        &format!(
+            "`{}` · {} worker(s) · release {}",
+            text("node"),
+            num("workers"),
+            if release.is_empty() { "none".to_string() } else { release }
+        ),
+    );
+    o.kv(
+        "load",
+        &format!(
+            "{} served here, {} forwarded to peers",
+            num("busy"),
+            num("forwarded")
+        ),
+    );
+    let empty: Vec<crate::json::Value> = Vec::new();
+    let peers = state.get("peers").and_then(|v| v.as_arr()).unwrap_or(&empty);
+    if peers.is_empty() {
+        o.kv("peers", &o.p(Role::Dim, "none on the switch yet"));
+        return;
+    }
+    let mut synced = 0usize;
+    o.kv("peers", &format!("{} on the switch", peers.len()));
+    for peer in peers {
+        let ip = peer.get("ip").and_then(|v| v.as_str()).unwrap_or("?");
+        let in_sync = peer.get("in_sync").and_then(|v| v.as_bool()).unwrap_or(false);
+        if in_sync {
+            synced += 1;
+        }
+        let release = peer.get("release").and_then(|v| v.as_str()).unwrap_or("");
+        o.line(&format!(
+            "{:<15} {} · {} worker(s) · {} busy · {}",
+            ip,
+            if release.is_empty() { "no release" } else { release },
+            peer.get("workers").and_then(|v| v.as_i64()).unwrap_or(0),
+            peer.get("busy").and_then(|v| v.as_i64()).unwrap_or(0),
+            if in_sync {
+                o.p(Role::Ok, "in sync")
+            } else {
+                o.p(Role::Warn, "out of sync")
+            }
+        ));
+    }
+    o.kv(
+        "synced",
+        &format!("{} of {} peer(s) serve the same release", synced, peers.len()),
+    );
+}
+
 fn history_block(o: &Out) {
     o.head("last import");
     match fs::read_to_string(LOG) {
@@ -451,6 +513,7 @@ fn report(o: &Out) {
     machine_block(o);
     usb_block(o);
     serving_block(o);
+    cluster_block(o);
     history_block(o);
     println!();
 }
