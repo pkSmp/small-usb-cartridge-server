@@ -7,12 +7,21 @@
 //!
 //! Everything is std-only: no crates, no interpreter at runtime.
 
+mod archive;
 mod art;
+mod auth;
+mod blueprint;
 mod bootart;
+mod chunks;
 mod cluster;
 mod console;
+mod dns;
+mod erasure;
+mod fleet;
 mod font;
+mod gzip;
 mod hash;
+mod ident;
 mod import;
 mod inflate;
 mod json;
@@ -20,6 +29,7 @@ mod machine;
 mod placement;
 mod png;
 mod publish;
+mod spec;
 mod status;
 mod sys;
 mod theme;
@@ -35,6 +45,8 @@ fn usage() -> ! {
          commands:\n\
          \x20 web [--root DIR] [--offset N] [--workers N] [--bind ADDR]   serve the cartridge sites\n\
          \x20 cluster [--root DIR] [--name ID] [--offset N]   share sites and load with the boxes on the switch\n\
+         \x20 fleet [--name ID] [--beacon PORT] [--dns PORT]   share storage and updates with the boxes on the switch\n\
+         \x20 fleet status | store | key | archive | adopt   inspect or manage the fleet\n\
          \x20 publish                        copy the live release into RAM\n\
          \x20 import DEVICE                  ingest a cartridge\n\
          \x20 status [--watch]               report what the machine sees\n\
@@ -59,6 +71,7 @@ fn main() -> ExitCode {
         "art" => run_art(&args[2..]),
         "web" => run_web(&args[2..]),
         "cluster" => run_cluster(&args[2..]),
+        "fleet" => run_fleet(&args[2..]),
         "publish" => publish::run(),
         "import" => run_import(&args[2..]),
         "status" => status::run(args[2..].iter().any(|a| a == "--watch" || a == "-w")),
@@ -235,6 +248,72 @@ fn run_cluster(args: &[String]) -> Result<i32, String> {
     }
     cluster::run(root, control, beacon, workers, name, offset)?;
     Ok(0)
+}
+
+/// `fleet` either runs the service or answers a question about the last run.
+fn run_fleet(args: &[String]) -> Result<i32, String> {
+    match args.first().map(String::as_str) {
+        Some("status") => return fleet::status(),
+        Some("store") => return fleet::sites_on_disk(),
+        Some("archive") => return fleet::archive_now(),
+        Some("adopt") => return fleet::adopt(),
+        Some("key") => {
+            let created = auth::ensure_key()?;
+            if created {
+                println!("wrote a fleet key to {}", auth::KEY_FILE);
+                println!("copy it to every node; without it, releases are accepted unsigned");
+            } else {
+                println!("a fleet key already exists at {}", auth::KEY_FILE);
+            }
+            return Ok(0);
+        }
+        Some("id") => {
+            let me = ident::load_or_create();
+            println!("{}  {}", me.name, me.hex());
+            return Ok(0);
+        }
+        _ => {}
+    }
+    let mut root = PathBuf::from("/run/cartridge");
+    let mut beacon = fleet::BEACON;
+    let mut control = fleet::CONTROL;
+    let mut dns_port: Option<u16> = None;
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" => {
+                if let Some(v) = args.get(i + 1) {
+                    root = PathBuf::from(v);
+                }
+                i += 2;
+            }
+            "--control" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    control = v;
+                }
+                i += 2;
+            }
+            "--beacon" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    beacon = v;
+                }
+                i += 2;
+            }
+            "--dns" => {
+                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                    dns_port = Some(v);
+                }
+                i += 2;
+            }
+            "--name" => {
+                name = args.get(i + 1).cloned();
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    fleet::run(root, control, beacon, dns_port, name)
 }
 
 fn run_import(args: &[String]) -> Result<i32, String> {

@@ -1,0 +1,23 @@
+[Unit]
+Description=Cartridge fleet - share storage, updates and identity with the boxes on the switch
+After=network-online.target local-fs.target cartridge-web.service
+Wants=network-online.target
+# The fleet owns no public port: it only talks to its peers on 29702/29703.
+
+[Service]
+Type=simple
+# One USB insert here becomes the next epoch on every node; the service watches
+# /proc/mounts itself, so no udev rule is needed.
+ExecStart=/usr/local/bin/cartridge fleet
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+# Metadata, repair and archive work must never outrank serving.
+Nice=10
+CPUWeight=100
+IOWeight=50
+ProtectSystem=full
+ReadWritePaths=/srv/cartridge /run /var/log/cartridge /var/lib/cartridge /etc/cartridge
+
+[Install]
+WantedBy=multi-user.target
