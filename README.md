@@ -8,7 +8,7 @@ keeps serving. Web server, import, art and status are all one
 
 > **Built for a fanless Chromebox on a shelf.** This is the whole stack for one
 > machine: an HP Chromebox G2 (2-core Celeron 3865U, 12 GB RAM, Debian 13) driving a
-> TV as the console. It boots in 12.8 s, the web tier idles at ~3 MB RSS, and it
+> TV as the console. It boots in 6.5 s, the web tier idles at ~3 MB RSS, and it
 > serves **55k requests/s on loopback** with a 3.5 ms p99 at 128 connections. No
 > nginx, no Python, no shell scripts at runtime.
 
@@ -89,7 +89,7 @@ Same machine, same 1360-byte file, before (nginx + Python + shell) and after:
 
 | Metric | Before | Cartridge |
 |---|---|---|
-| Boot to multi-user | 36.0 s | **12.8 s** |
+| Boot to multi-user | 36.0 s | **6.5 s** |
 | Installed packages | 820 | **571** |
 | Web RSS idle | 2.9 MB | 3.0 MB |
 | Loopback rps, 1 connection | 516 | **29,724** |
