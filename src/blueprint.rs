@@ -13,7 +13,7 @@
 //! leaderless design into a data-loss design, so it is handled here, once.
 
 use crate::hash;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;

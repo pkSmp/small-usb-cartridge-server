@@ -6,7 +6,6 @@ use crate::sys;
 use crate::theme::{Role, Theme};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const LOG: &str = "/var/log/cartridge/import.log";
 const LIVE: &str = "/srv/cartridge/live";
@@ -193,13 +192,8 @@ fn inspect_cartridge(o: &Out, _dev: &str, mount: &Path) -> bool {
         o.kv("art", &o.p(Role::Dim, "no boot.png (keeping the current art)"));
     }
 
-    let free_kb = Command::new("df")
-        .args(["-B1", "--output=avail", "/srv/cartridge"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|t| t.lines().nth(1).and_then(|l| l.trim().parse::<u64>().ok()))
-        .map(|b| b / 1024)
+    let free_kb = sys::filesystem_bytes("/srv/cartridge")
+        .map(|(_, _, free)| free / 1024)
         .unwrap_or(u64::MAX);
     // RAM never refuses: publish stages what fits and links the rest.
     let verdict = if total_kb + 131_072 > free_kb {
