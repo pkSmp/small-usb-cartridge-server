@@ -340,10 +340,25 @@ fn beacon_send(shared: Arc<Shared>, port: u16) {
     };
     let _ = sock.set_broadcast(true);
     let target = SocketAddrV4::new(Ipv4Addr::BROADCAST, port);
+    // Before the link has an address every send fails; say that once, not twice
+    // a second for the whole boot.
+    let mut warned: Option<Instant> = None;
+    let mut last_code = 0;
     loop {
         let text = beacon_text(&shared);
-        if let Err(e) = sock.send_to(text.as_bytes(), target) {
-            log("warn", &format!("cluster: beacon failed: {}", e));
+        match sock.send_to(text.as_bytes(), target) {
+            Ok(_) => last_code = 0,
+            Err(e) => {
+                let code = e.raw_os_error().unwrap_or(0);
+                let due = warned
+                    .map(|when| when.elapsed() > Duration::from_secs(60))
+                    .unwrap_or(true);
+                if code != last_code || due {
+                    log("warn", &format!("cluster: beacon failed: {}", e));
+                    warned = Some(Instant::now());
+                    last_code = code;
+                }
+            }
         }
         sys::sleep_ms(BEACON_EVERY.as_millis() as u64);
     }
