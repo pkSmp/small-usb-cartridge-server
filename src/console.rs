@@ -259,7 +259,21 @@ fn recent_messages(theme: &crate::theme::Theme, cols: usize) -> Vec<String> {
     out
 }
 
-fn draw_status() {
+/// The expensive part of the report: a recursive size walk per site. It is
+/// reused until the live release changes, or for ten seconds at most.
+struct Sites {
+    live: String,
+    rows: Vec<[String; 4]>,
+    total_kb: u64,
+}
+
+fn live_target() -> String {
+    fs::read_link("/srv/cartridge/live")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn draw_status(cache: &mut Option<Sites>, refresh: bool) {
     let (rows, cols) = terminal_size();
     let heights = fs::read_to_string(ART_ROWS)
         .ok()
@@ -295,8 +309,13 @@ fn draw_status() {
         ));
     }
 
-    let (sites, total_kb) = live_rows();
-    if sites.is_empty() {
+    let live = live_target();
+    if refresh || cache.as_ref().map(|c| c.live != live).unwrap_or(true) {
+        let (rows, total_kb) = live_rows();
+        *cache = Some(Sites { live, rows, total_kb });
+    }
+    let sites = cache.as_ref().unwrap();
+    if sites.rows.is_empty() {
         block.push(format!(
             "{}  {}",
             theme.paint(Role::Dim, "sites"),
@@ -308,10 +327,14 @@ fn draw_status() {
             theme.paint(Role::Dim, "sites"),
             theme.paint(
                 Role::Text,
-                &format!("{} site(s), {} live", sites.len(), sys::human_kb(total_kb))
+                &format!(
+                    "{} site(s), {} live",
+                    sites.rows.len(),
+                    sys::human_kb(sites.total_kb)
+                )
             )
         ));
-        for line in table_lines(&sites) {
+        for line in table_lines(&sites.rows) {
             block.push(theme.paint(Role::Text, &line));
         }
     }
@@ -384,6 +407,8 @@ pub fn run() -> Result<i32, String> {
     }
 
     let mut log_pos = fs::metadata(IMPORT_LOG).map(|m| m.len()).unwrap_or(0);
+    let mut sites: Option<Sites> = None;
+    let mut tick: u64 = 0;
 
     loop {
         if !console_ok && probe_console() {
@@ -391,8 +416,9 @@ pub fn run() -> Result<i32, String> {
         }
         // Redraw four times a second so a new message is on screen at once.
         if art_done() {
-            draw_status();
+            draw_status(&mut sites, tick % 40 == 0);
         }
+        tick = tick.wrapping_add(1);
 
         // Mirror new import-log lines into the console log (the old tail -F).
         if let Ok(meta) = fs::metadata(IMPORT_LOG) {
