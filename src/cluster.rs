@@ -225,17 +225,12 @@ impl Shared {
     }
 }
 
-/// A short, stable name for this box: the machine id when the system has one,
-/// the hostname otherwise, hashed so beacons stay uniform.
+/// A short, stable name for this box. It comes from the same random 128-bit
+/// install id the fleet layer uses, never from `/etc/machine-id`: cloned and
+/// imaged PCs share that file, so two boxes would announce one name and each
+/// would throw the other's beacon away as its own.
 fn node_id() -> String {
-    let mut text = fs::read_to_string("/etc/machine-id").unwrap_or_default();
-    if text.trim().is_empty() {
-        text = sys::read_trim("/proc/sys/kernel/hostname").unwrap_or_default();
-    }
-    if text.trim().is_empty() {
-        text = format!("{}-{}", sys::lan_ip(), std::process::id());
-    }
-    hash::bytes(text.trim().as_bytes())[..8].to_string()
+    crate::ident::load_or_create().name
 }
 
 // ------------------------------------------------------------- release info
