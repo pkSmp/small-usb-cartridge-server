@@ -30,6 +30,7 @@ mod inflate;
 mod json;
 mod machine;
 mod netmap;
+mod offload;
 mod placement;
 mod png;
 mod publish;
@@ -63,7 +64,8 @@ fn usage() -> ! {
          \x20 art calibrate [--order rgb|bgr]\n\
          \x20 art verify-calibrate\n\
          \x20 art build IMAGE --out DIR\n\
-         \x20 art draw ART.bin\n\
+         \x20   art draw ART.bin
+  gpu                            measure the graphics card against the CPU, task by task\n\
          \x20 art verify MAP.json"
     );
     std::process::exit(2);
@@ -83,6 +85,10 @@ fn main() -> ExitCode {
         "import" => run_import(&args[2..]),
         "status" => status::run(args[2..].iter().any(|a| a == "--watch" || a == "-w")),
         "sites" => status::sites_cmd(),
+        "gpu" => {
+            print!("{}", offload::report());
+            Ok(0)
+        }
         "console" => console::run(),
         "hash" => {
             for p in &args[2..] {

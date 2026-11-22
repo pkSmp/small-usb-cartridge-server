@@ -130,6 +130,13 @@ pub fn hex(digest: &[u8; 32]) -> String {
 }
 
 pub fn bytes(data: &[u8]) -> String {
+    // Bulk buffers may go to the graphics card, but only after it has been
+    // measured faster than this CPU on this machine and has agreed with it
+    // byte for byte on the same input. `offload` returns None everywhere else,
+    // which is the common case and the whole point of measuring.
+    if let Some(d) = crate::offload::sha256_bulk(data) {
+        return hex(&d);
+    }
     let mut h = Sha256::new();
     h.update(data);
     hex(&h.finish())

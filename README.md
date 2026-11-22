@@ -315,6 +315,38 @@ symlinks (the RAM staging uses them), which the server follows only inside the
 release and the served root, so a release directory must not be writable by
 anyone else.
 
+## What the graphics card is allowed to do
+
+Nothing on the request path. A request costs about 10 us of CPU - `epoll`,
+`read`, a path lookup, `write` and `sendfile` - and one GPU dispatch costs more
+than that on its own, so a static file server has nothing to hand a card. What a
+card can do is bulk work between requests, and only when it is genuinely faster:
+
+- `offload.rs` opens `libOpenCL.so.1` with `dlopen` (no crates), finds a GPU
+device, and **measures every task against the CPU on this machine** before using
+  it. If there is no card, no driver, or the driver's answer differs from the
+  CPU by one byte, the CPU keeps the work and nothing else in the program
+  changes.
+- `cartridge gpu` prints the table for this box. On the reference laptop
+  (Intel HD 610, 2 units @ 400 MHz):
+
+  ```
+  offload: Mesa Intel(R) HD Graphics 610 (KBL GT1), 2 units @ 400 MHz
+    sha256   gpu       4.3 MB/s    cpu     100.8 MB/s    -> cpu
+    nearest  gpu      48.7 Mpix/s  cpu      14.5 Mpix/s  -> gpu
+  ```
+
+  Bulk hashing stays on the CPU there, so `import` and `restore` are untouched.
+  Palette mapping wins 3.4x, so any image large enough to be worth a dispatch
+  goes to the card; the boot art is about 12k pixels, below that line, which is
+  why the console still maps it on the CPU.
+- The GPU never decides anything by itself: `hash::bytes` asks the offload layer,
+  gets `None` when the CPU won, and hashes as it always did.
+
+The service account needs to be in the `render` group to open
+`/dev/dri/renderD128`, and rusticl needs `RUSTICL_ENABLE=iris`; the offload layer
+sets that itself rather than depending on the environment it was started in.
+
 ## Where things live
 
 ```
