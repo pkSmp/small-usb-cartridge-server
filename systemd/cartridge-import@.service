@@ -8,7 +8,10 @@ DefaultDependencies=no
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/cartridge import /dev/%I
-TimeoutStartSec=45min
+# Hashing a cartridge is the card's job now, and a small card hashes slower than
+# the CPU it replaced: a few GB can take a quarter of an hour. The import still
+# runs at the lowest priority, so this is only a runaway guard.
+TimeoutStartSec=3h
 # A stick can be read whenever; a request cannot wait for it.
 Nice=19
 CPUWeight=10

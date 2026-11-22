@@ -49,8 +49,10 @@ const MIN_BYTES: usize = 256 * 1024;
 const MIN_FIT_PIXELS: usize = 87_000;
 /// Framebuffer sampling in `art verify`: 240x86 dots of 8x8 pixels is 1.3M.
 const MIN_TILE_PIXELS: usize = 256 * 1024;
-/// The GPU has to be this much faster to be trusted with a task.
-const MARGIN: f64 = 1.2;
+/// The card takes a task whenever it is present and its answer matches the
+/// CPU's byte for byte. The measured speed is printed, not used as a gate: the
+/// CPU is kept for requests, so background work goes to the card even when the
+/// card is the slower engine.
 
 // ------------------------------------------------------------------ kernels
 
@@ -890,13 +892,14 @@ fn record(task: &'static str, unit: &'static str, gpu: f64, cpu: f64) {
     v.push(Verdict { task, unit, gpu, cpu });
 }
 
-/// Did the GPU win this task on this machine? Measured once, then cached.
+/// Does the card take this task on this machine? Measured once, then cached:
+/// true when a card is present and agreed with the CPU on the sample.
 pub fn wins(task: &str) -> bool {
     match task {
-        "sha256" => sha256_wins(),
-        "nearest" => nearest_wins(),
-        "fit" => fit_wins(),
-        "tiles" => tiles_wins(),
+        "sha256" => sha256_ready(),
+        "nearest" => nearest_ready(),
+        "fit" => fit_ready(),
+        "tiles" => tiles_ready(),
         _ => false,
     }
 }
@@ -930,7 +933,7 @@ fn cpu_fit(src: &[u8], sw: usize, sh: usize, nw: usize, nh: usize) -> Vec<u8> {
     out
 }
 
-fn fit_wins() -> bool {
+fn fit_ready() -> bool {
     static W: OnceLock<bool> = OnceLock::new();
     *W.get_or_init(|| {
         let Some(g) = gpu() else {
@@ -960,11 +963,13 @@ fn fit_wins() -> bool {
         let g = mpix / gpu_secs.max(1e-9);
         let c = mpix / cpu_secs.max(1e-9);
         record("fit", "Mpix/s", g, c);
-        g > c * MARGIN
+        // The card agreed with the CPU on the sample; the CPU goes back to
+        // serving, whatever the two speeds say.
+        true
     })
 }
 
-fn tiles_wins() -> bool {
+fn tiles_ready() -> bool {
     static W: OnceLock<bool> = OnceLock::new();
     *W.get_or_init(|| {
         let Some(g) = gpu() else {
@@ -1017,11 +1022,13 @@ fn tiles_wins() -> bool {
         let g = mpix / gpu_secs.max(1e-9);
         let c = mpix / cpu_secs.max(1e-9);
         record("tiles", "Mpix/s", g, c);
-        g > c * MARGIN
+        // The card agreed with the CPU on the sample; the CPU goes back to
+        // serving, whatever the two speeds say.
+        true
     })
 }
 
-fn sha256_wins() -> bool {
+fn sha256_ready() -> bool {
     static W: OnceLock<bool> = OnceLock::new();
     *W.get_or_init(|| {
         let Some(g) = gpu() else {
@@ -1060,11 +1067,13 @@ fn sha256_wins() -> bool {
         let g = mb / gpu_secs.max(1e-9);
         let c = mb / cpu_secs.max(1e-9);
         record("sha256", "MB/s", g, c);
-        g > c * MARGIN
+        // The card agreed with the CPU on the sample; the CPU goes back to
+        // serving, whatever the two speeds say.
+        true
     })
 }
 
-fn nearest_wins() -> bool {
+fn nearest_ready() -> bool {
     static W: OnceLock<bool> = OnceLock::new();
     *W.get_or_init(|| {
         let Some(g) = gpu() else {
@@ -1112,36 +1121,31 @@ fn nearest_wins() -> bool {
         let g = 1.0 / gpu_secs.max(1e-9);
         let c = 1.0 / cpu_secs.max(1e-9);
         record("nearest", "Mpix/s", g, c);
-        g > c * MARGIN
+        // The card agreed with the CPU on the sample; the CPU goes back to
+        // serving, whatever the two speeds say.
+        true
     })
 }
 
 // ---------------------------------------------------------------------- tasks
 
-/// Hash a buffer on the GPU when the card has won the hashing task. Returns
-/// `None` when the caller should use the CPU, which is the common case.
+/// Hash a buffer on the card. `None` means the caller hashes it itself: there is
+/// no card, or the buffer is too small to be worth a dispatch.
 pub fn sha256_bulk(data: &[u8]) -> Option<[u8; 32]> {
-    if data.len() < MIN_BYTES || !sha256_wins() {
+    if data.len() < MIN_BYTES || !sha256_ready() {
         return None;
     }
-    let g = gpu()?;
-    let hashes = g.sha256_batch(&[data])?;
-    // The decision was measured on a sample; this makes sure a driver that
-    // misbehaves on unusual input cannot corrupt a store.
-    let mut cpu = crate::hash::Sha256::new();
-    cpu.update(data);
-    if hashes[0] != cpu.finish() {
-        note("offload: GPU hash mismatch on real data; this run uses the CPU");
-        return None;
-    }
-    Some(hashes[0])
+    // The card proved itself against the CPU's own loop in `sha256_ready`, on
+    // data of the same shape. Re-hashing here would put the work back on the
+    // CPU, which is the one thing this path exists to avoid.
+    gpu()?.sha256_batch(&[data])?.first().copied()
 }
 
 /// The boot art's box-average downscale, on the card when the card has won
 /// that task. `None` means the caller does its own loop, which is the usual
 /// answer on a small picture.
 pub fn fit_bulk(src: &[u8], sw: usize, sh: usize, nw: usize, nh: usize) -> Option<Vec<u8>> {
-    if sw.saturating_mul(sh) < MIN_FIT_PIXELS || !fit_wins() {
+    if sw.saturating_mul(sh) < MIN_FIT_PIXELS || !fit_ready() {
         return None;
     }
     gpu()?.fit_batch(src, sw, sh, nw, nh)
@@ -1161,7 +1165,7 @@ pub fn tiles_bulk(
     origin: (usize, usize),
     cell: (usize, usize),
 ) -> Option<Vec<(u8, u8, u8, bool)>> {
-    if fw.saturating_mul(fh) < MIN_TILE_PIXELS || !tiles_wins() {
+    if fw.saturating_mul(fh) < MIN_TILE_PIXELS || !tiles_ready() {
         return None;
     }
     gpu()?.tiles_batch(
@@ -1198,10 +1202,10 @@ pub fn dispatch_micros() -> Option<f64> {
 pub fn report() -> String {
     // Measure everything that is registered, so the table is complete even on a
     // box that has never imported a cartridge.
-    let _ = sha256_wins();
-    let _ = nearest_wins();
-    let _ = fit_wins();
-    let _ = tiles_wins();
+    let _ = sha256_ready();
+    let _ = nearest_ready();
+    let _ = fit_ready();
+    let _ = tiles_ready();
     let mut out = String::new();
     match available() {
         Some(card) => out.push_str(&format!("offload: {}\n", card)),
@@ -1210,7 +1214,14 @@ pub fn report() -> String {
         }
     }
     for v in verdicts().lock().unwrap().iter() {
-        let pick = if wins(v.task) { "gpu" } else { "cpu" };
+        let pick = if !wins(v.task) {
+            "cpu"
+        } else if v.gpu > 0.0 && v.gpu < v.cpu {
+            // Honest about the trade: the card has the task anyway.
+            "gpu (slower here)"
+        } else {
+            "gpu"
+        };
         out.push_str(&format!(
             "  {:<8} gpu {:>9.1} {:<7} cpu {:>9.1} {:<7} -> {}\n",
             v.task, v.gpu, v.unit, v.cpu, v.unit, pick

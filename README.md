@@ -326,29 +326,36 @@ anyone else.
 
 Nothing on the request path. A request costs about 10 us of CPU - `epoll`,
 `read`, a path lookup, `write` and `sendfile` - and one GPU dispatch costs more
-than that on its own, so a static file server has nothing to hand a card. What a
-card can do is bulk work between requests, and only when it is genuinely faster:
+than that on its own, so a static file server has nothing to hand a card. The
+CPU is left with three jobs and no others: booting, loading the sites, and
+serving them. Every other task the server has that a card can execute runs on
+the card whenever one is present.
 
 - `offload.rs` opens `libOpenCL.so.1` with `dlopen` (no crates), finds a GPU
-device, and **measures every task against the CPU on this machine** before using
-  it. If there is no card, no driver, or the driver's answer differs from the
-  CPU by one byte, the CPU keeps the work and nothing else in the program
-  changes.
+device, and **measures every task against the CPU on this machine**. The table is
+  information, not a gate: when a card is present and its answer matches the
+  CPU's byte for byte on the measured sample, the card takes the task even when
+  it is the slower engine. A scan that takes four minutes on the card instead of
+  ten seconds on the CPU is the trade this server makes on purpose, because the
+  CPU is answering requests the whole time.
+- If there is no card, no driver, or the driver's answer differs from the CPU by
+  one byte, the CPU keeps the work and nothing else in the program changes. A
+  task also stays on the CPU below a floor - 256 KiB of bytes, 87k picture
+  pixels, 256k framebuffer pixels - because one dispatch costs more than the
+  whole job at that size.
 - `cartridge gpu` prints the table for this box. On the reference laptop
   (Intel HD 610, 2 units @ 400 MHz):
 
   ```
   offload: Mesa Intel(R) HD Graphics 610 (KBL GT1), 2 units @ 400 MHz
-    sha256   gpu       4.3 MB/s    cpu     100.8 MB/s    -> cpu
+    sha256   gpu       4.3 MB/s    cpu     100.8 MB/s    -> gpu (slower here)
     nearest  gpu      48.7 Mpix/s  cpu      14.5 Mpix/s  -> gpu
   ```
 
   The same table gains a `fit` and a `tiles` row on a box with a card; every row
-  is measured on that machine, not carried over from this one.
-
-  Bulk hashing stays on the CPU there, so `import` and `restore` are untouched.
-  Palette mapping wins 3.4x, so any image large enough to be worth a dispatch
-  goes to the card.
+  is measured on that machine, not carried over from this one. `(slower here)`
+  is the honest note that this card hashes 23x slower than its CPU and does the
+  work anyway.
 - The boot art is the card's other job, and all of it stays optional: `fit` is
   the box-average reduction from the picture down to the console grid (a
   1200x630 boot image is 750k source pixels, well past what one dispatch costs)
@@ -364,8 +371,7 @@ device, and **measures every task against the CPU on this machine** before using
 - The cluster and the fleet hand it the same way. Every bulk byte job they do
   goes through `hash::bytes`: scanning a stick in `import`, scanning a release
   pulled from a peer, verifying a chunk a peer sent, and re-fetching a lost
-  share in `repair`. On a card that wins the hashing measurement, that scanning
-  and repair runs on the card; on one that loses it, nothing changes. A boot
+  share in `repair`. All of that runs on the card when there is one. A boot
   picture that arrives with a release goes through the same `fit`/`tiles` path.
   Nothing calls the card directly: `hash::bytes` asks the offload layer, gets
   `None` when the CPU won, and hashes as it always did.
