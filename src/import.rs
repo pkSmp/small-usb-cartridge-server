@@ -482,6 +482,8 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
     if let Err(e) = crate::publish::run() {
         log(&format!("warning: cartridge-publish did not run: {}", e));
     }
+    // Keep the plain-text network map current on a box with no fleet daemon.
+    let _ = crate::fleet::refresh_map();
     ok("done");
     let _ = STORE;
     Ok(0)

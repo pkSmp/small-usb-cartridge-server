@@ -1511,6 +1511,34 @@ fn solo_map() -> Option<String> {
     Some(netmap::render(bp.epoch, &bp.root, &boxes, &bp, &owned))
 }
 
+/// Keep the map current on a box with no fleet daemon: `import` calls this
+/// after a release. When the daemon is running it owns the file, so this leaves
+/// it alone rather than replacing a whole-fleet map with a one-box one.
+pub fn refresh_map() -> Option<PathBuf> {
+    let daemon_live = fs::metadata(state_file())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age < Duration::from_secs(10))
+        .unwrap_or(false);
+    if daemon_live {
+        return None;
+    }
+    let text = solo_map()?;
+    let path = netmap_path();
+    if fs::read_to_string(&path).map(|old| old == text).unwrap_or(false) {
+        return Some(path);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("new");
+    if fs::write(&tmp, &text).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    }
+    Some(path)
+}
+
 pub fn map_cmd() -> Result<i32, String> {
     let path = netmap_path();
     let text = match fs::read_to_string(&path) {
