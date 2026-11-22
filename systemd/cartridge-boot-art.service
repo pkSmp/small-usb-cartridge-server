@@ -1,7 +1,7 @@
 [Unit]
 Description=Cartridge boot art on the console
-# No fixed sleep: boot-art already waits for tty1 to answer and lowers printk
-# before it draws, so nothing can scroll the mosaic off the screen.
+# Draw once boot output has settled, otherwise later kernel/service messages
+# scroll the mosaic off the screen.
 After=local-fs.target systemd-vconsole-setup.service console-setup.service getty@tty1.service
 Before=cartridge-console.service
 ConditionPathExists=/var/lib/cartridge/art/art.bin
@@ -9,6 +9,7 @@ ConditionPathExists=/var/lib/cartridge/art/art.bin
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=/bin/sleep 3
 ExecStart=/usr/local/bin/cartridge boot-art
 StandardOutput=null
 TimeoutStartSec=120

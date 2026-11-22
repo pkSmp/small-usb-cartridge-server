@@ -12,9 +12,7 @@ const ART_DIR: &str = "/var/lib/cartridge/art";
 const STATE_PNG: &str = "/var/lib/cartridge/boot.png";
 const FONT: &str = "/usr/local/share/cartridge/cartridge.psf.gz";
 const LOG: &str = "/var/log/cartridge/art.log";
-// Probe above the art: the console owns every row below it and erases a
-// marker written down there on each redraw.
-const SCRATCH_ROW: usize = 1;
+const SCRATCH_ROW: usize = 67;
 
 fn log(text: &str) {
     sys::append(LOG, &format!("{} {}\n", sys::fmt_time("%F %T"), text));
@@ -49,10 +47,7 @@ fn ensure_font() -> bool {
     if !Path::new(FONT).is_file() {
         return false;
     }
-    // One retry is enough: tty1 has already answered the probe. The old third
-    // attempt only added a second of dead boot time on hardware where the
-    // kernel refuses the font ioctls anyway.
-    for attempt in 1..=2 {
+    for attempt in 1..=3 {
         crate::font::activate_tty1();
         // The kernel refuses KDFONTOP's unicode-table ops on this vt (EINVAL),
         // and glyphs without the table map the half blocks to the wrong cells,
@@ -70,7 +65,7 @@ fn ensure_font() -> bool {
             log(&format!("console font active (attempt {})", attempt));
             return true;
         }
-        sys::sleep_ms(200);
+        sys::sleep_ms(1000);
     }
     false
 }
