@@ -1,7 +1,7 @@
 [Unit]
 Description=Cartridge import for /dev/%I
 Documentation=file:/etc/cartridge/config.example.json
-After=local-fs.target
+After=local-fs.target cartridge-web.service
 ConditionPathExists=/dev/%I
 DefaultDependencies=no
 
@@ -9,7 +9,9 @@ DefaultDependencies=no
 Type=oneshot
 ExecStart=/usr/local/bin/cartridge import /dev/%I
 TimeoutStartSec=45min
-Nice=10
+# A stick can be read whenever; a request cannot wait for it.
+Nice=19
+CPUWeight=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 ProtectSystem=full

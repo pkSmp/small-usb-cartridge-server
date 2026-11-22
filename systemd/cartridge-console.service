@@ -12,6 +12,12 @@ Type=simple
 ExecStart=/usr/local/bin/cartridge console
 Restart=always
 RestartSec=3
+# A status line is worth nothing next to a request: it redraws with whatever
+# the web tier is not using, and re-reads the release tree every few seconds
+# instead of on every frame.
+Nice=19
+CPUWeight=1
+IOSchedulingClass=idle
 
 [Install]
 WantedBy=multi-user.target

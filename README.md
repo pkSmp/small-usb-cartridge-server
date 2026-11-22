@@ -29,7 +29,7 @@ keeps serving. Web server, import, art and status are all one
 | **The network on one page** | Every box writes `/srv/cartridge/netmap.txt`: plain text, uncompressed, the same bytes on every machine. It lists each computer with its auto-generated name, address, epoch, load and GPU presence, every file the cartridge carried, and which computers hold each chunk. Because it is rendered from the beacon list and the ownership plan, it needs no controller and no shared writable file. |
 | **A zip you can open anywhere** | `cartridge fleet zip` writes `network-<epoch>.zip`: the network map, the blueprint and every site file, stored rather than deflated. The solid `.cart` archive stays the small one; the zip is the one a person can hand to someone else. |
 | **The smallest backup it can be** | `archive/<epoch>.cart` is one solid deflate stream over every distinct chunk, and its index carries no hashes at all: a restore recomputes them from the bytes and checks the release root. A 300-page site of 142.5 KB becomes a 6.4 KB file; the live release of 13.6 KB becomes 4.0 KB. |
-| **Live status screen** | Under the art: the Markdown site table, the machine and staging facts, and the newest import and boot messages as plain text, redrawn four times a second so a line appears as it is logged. Big text uses the brightest colour from the art; small labels use a reserved bright red so they stay readable, falling back to a saturated red or green from the art when no palette slot is free. Storage reports the internal filesystem's actual used and free space, so the OS, the server binary and every installed program are included; the removable cartridge is never counted. |
+| **Live status screen** | Under the art: the Markdown site table, the machine and staging facts, and the newest import and boot messages as plain text, redrawn once a second so a line appears as it is logged, with the release tree re-read every five seconds and the theme only when the art changes, so the report never competes with serving. Big text uses the brightest colour from the art; small labels use a reserved bright red so they stay readable, falling back to a saturated red or green from the art when no palette slot is free. Storage reports the internal filesystem's actual used and free space, so the OS, the server binary and every installed program are included; the removable cartridge is never counted. |
 
 ## Setup (5 minutes)
 
@@ -54,6 +54,13 @@ keeps serving. Web server, import, art and status are all one
    `cartridge-publish.path` re-stages the release when the cluster activates a
    new one (the cluster leaves a request flag; staging mounts a tmpfs, which only
    root may do), so a release pulled from a peer is served without anyone asking.
+
+   The box boots into serving and nothing else. Staging, then `cartridge-web`,
+   then `cartridge-cluster` are the only units on the critical path; everything
+   else - the boot art, the status console, the fleet and a stick import - is
+   ordered after the web tier and runs at `Nice=19`, `CPUWeight=1` and the idle
+   I/O class, so it only gets the CPU the sites are not using. The art's two
+   pixel loops and the fleet's hashing ask the card first.
 3. **Make a cartridge.** Format a stick as FAT32 or ext4, put a `config.json`
    holding `{}` at the root, add one digits-only folder per port and an optional
    `boot.png`, then plug it in. The new sites appear on screen and in the import

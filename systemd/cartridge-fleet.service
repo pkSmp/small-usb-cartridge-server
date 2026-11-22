@@ -12,10 +12,11 @@ ExecStart=/usr/local/bin/cartridge fleet
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
-# Metadata, repair and archive work must never outrank serving.
-Nice=10
-CPUWeight=100
-IOWeight=50
+# Metadata, repair and archive work must never outrank serving: it runs in the
+# CPU time the web tier leaves over, and its hashing asks the card first.
+Nice=19
+CPUWeight=10
+IOWeight=10
 ProtectSystem=full
 ReadWritePaths=/srv/cartridge /run /var/log/cartridge /var/lib/cartridge /etc/cartridge
 

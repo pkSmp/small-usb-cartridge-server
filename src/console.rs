@@ -7,6 +7,7 @@ use crate::machine;
 use crate::sys;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant, SystemTime};
 
 const IMPORT_LOG: &str = "/var/log/cartridge/import.log";
 const CONSOLE_LOG: &str = "/var/log/cartridge/console.log";
@@ -194,7 +195,79 @@ fn cluster_line(theme: &crate::theme::Theme) -> Option<String> {
     ))
 }
 
-fn draw_status() {
+/// What the report re-reads, and how often. The frame is drawn once a second,
+/// but the release tree, the theme and the cluster state change far more slowly
+/// than that, and every one of those reads is CPU the web tier should have.
+struct Snapshot {
+    theme: crate::theme::Theme,
+    theme_stamp: (Option<SystemTime>, Option<SystemTime>),
+    sites: Vec<[String; 4]>,
+    total_kb: u64,
+    sites_at: Option<Instant>,
+    usb: Vec<sys::Usb>,
+    usb_at: Option<Instant>,
+    cluster: Option<String>,
+    cluster_at: Option<Instant>,
+}
+
+const SITES_TTL: Duration = Duration::from_secs(5);
+const USB_TTL: Duration = Duration::from_secs(2);
+const CLUSTER_TTL: Duration = Duration::from_secs(2);
+
+fn stamps() -> (Option<SystemTime>, Option<SystemTime>) {
+    let at = |p: &str| fs::metadata(p).and_then(|m| m.modified()).ok();
+    (
+        at("/var/lib/cartridge/art/map.json"),
+        at("/var/lib/cartridge/calib.json"),
+    )
+}
+
+impl Snapshot {
+    fn new() -> Snapshot {
+        Snapshot {
+            theme: crate::theme::Theme::console(),
+            theme_stamp: stamps(),
+            sites: Vec::new(),
+            total_kb: 0,
+            sites_at: None,
+            usb: Vec::new(),
+            usb_at: None,
+            cluster: None,
+            cluster_at: None,
+        }
+    }
+
+    fn aged(at: Option<Instant>, now: Instant, ttl: Duration) -> bool {
+        at.map(|t| now.duration_since(t) >= ttl).unwrap_or(true)
+    }
+
+    fn refresh(&mut self) {
+        let now = Instant::now();
+        // The palette only changes when the art is rebuilt; a stat pair is a
+        // hundred times cheaper than parsing map.json and calib.json again.
+        let stamp = stamps();
+        if stamp != self.theme_stamp {
+            self.theme = crate::theme::Theme::console();
+            self.theme_stamp = stamp;
+        }
+        if Snapshot::aged(self.sites_at, now, SITES_TTL) {
+            let (rows, kb) = live_rows();
+            self.sites = rows;
+            self.total_kb = kb;
+            self.sites_at = Some(now);
+        }
+        if Snapshot::aged(self.usb_at, now, USB_TTL) {
+            self.usb = sys::usb_list();
+            self.usb_at = Some(now);
+        }
+        if Snapshot::aged(self.cluster_at, now, CLUSTER_TTL) {
+            self.cluster = cluster_line(&self.theme);
+            self.cluster_at = Some(now);
+        }
+    }
+}
+
+fn draw_status(s: &mut Snapshot) {
     let (rows, _cols) = terminal_size();
     let heights = fs::read_to_string(ART_ROWS)
         .ok()
@@ -202,11 +275,12 @@ fn draw_status() {
         .unwrap_or_else(art_height);
     let h = heights;
 
-    let theme = crate::theme::Theme::console();
+    s.refresh();
+    let theme = &s.theme;
     theme.install();
     use crate::theme::Role;
     let stamp = theme.paint(Role::Dim, &sys::fmt_time("%H:%M:%S"));
-    let usb = sys::usb_list();
+    let usb = &s.usb;
     let mut block: Vec<String> = Vec::new();
     if usb.is_empty() {
         block.push(format!(
@@ -230,7 +304,8 @@ fn draw_status() {
         ));
     }
 
-    let (sites, total_kb) = live_rows();
+    let sites = &s.sites;
+    let total_kb = s.total_kb;
     if sites.is_empty() {
         block.push(format!(
             "{}  {}",
@@ -255,8 +330,8 @@ fn draw_status() {
         theme.paint(Role::Dim, "machine"),
         theme.paint(Role::Text, &machine::summary())
     ));
-    if let Some(line) = cluster_line(&theme) {
-        block.push(line);
+    if let Some(line) = &s.cluster {
+        block.push(line.clone());
     }
     block.push(theme.paint(Role::Dim, "login   Ctrl+Alt+F2"));
 
@@ -312,6 +387,7 @@ pub fn run() -> Result<i32, String> {
 
     let mut log_pos = fs::metadata(IMPORT_LOG).map(|m| m.len()).unwrap_or(0);
     let mut timed = false;
+    let mut snap = Snapshot::new();
 
     loop {
         if !console_ok && probe_console() {
@@ -319,8 +395,8 @@ pub fn run() -> Result<i32, String> {
         }
         // Redraw every second so USB and release changes appear.
         if art_done() {
-            let start = std::time::Instant::now();
-            draw_status();
+            let start = Instant::now();
+            draw_status(&mut snap);
             if !timed {
                 timed = true;
                 log_line(&format!(

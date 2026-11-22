@@ -1,8 +1,8 @@
 [Unit]
 Description=Cartridge boot art on the console
-# Draw once boot output has settled, otherwise later kernel/service messages
-# scroll the mosaic off the screen.
-After=local-fs.target systemd-vconsole-setup.service console-setup.service getty@tty1.service
+# The sites come first. This is the least important unit on the box: it starts
+# only once the web tier is up, and it runs with whatever serving is not using.
+After=local-fs.target systemd-vconsole-setup.service console-setup.service getty@tty1.service cartridge-web.service
 Before=cartridge-console.service
 ConditionPathExists=/var/lib/cartridge/art/art.bin
 
@@ -12,7 +12,15 @@ RemainAfterExit=yes
 ExecStartPre=/bin/sleep 3
 ExecStart=/usr/local/bin/cartridge boot-art
 StandardOutput=null
-TimeoutStartSec=120
+# At the lowest priority a build can take minutes on a busy box; it must not be
+# killed halfway through and leave a half-drawn console.
+TimeoutStartSec=300
+# Last in line for the CPU and the disk: a boot picture must never delay a
+# request. The build hands its two pixel loops to the card when the card
+# measured faster, and the CPU finishes it in the gaps.
+Nice=19
+CPUWeight=1
+IOSchedulingClass=idle
 
 [Install]
 WantedBy=multi-user.target

@@ -7,6 +7,11 @@ ConditionPathExists=/srv/cartridge
 Type=oneshot
 ExecStart=/usr/local/bin/cartridge publish
 TimeoutStartSec=10min
+# Staging is the critical path to the first request: the web tier waits for
+# this copy, so it gets the CPU and the disk back rather than the idle class.
+CPUWeight=1000
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
 
 [Install]
 WantedBy=multi-user.target
