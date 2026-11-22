@@ -375,12 +375,21 @@ pub fn restore_full(path: &Path) -> io::Result<(Blueprint, Vec<(String, Vec<u8>)
         }
         let (bp, list) = decode_meta_with_hashes(&bytes, epoch, &root)
             .ok_or_else(|| bad("index is corrupt"))?;
-        (chunk_lengths(&bp), indexed_files(&bp), Some(list), None)
+        let tree = indexed_files(&bp)
+            .ok_or_else(|| bad("index references a chunk it does not carry"))?;
+        (chunk_lengths(&bp), tree, Some(list), None)
     } else if let Some(len) = bp_text_len {
         let text = std::str::from_utf8(&buf[pos..pos + len]).map_err(|_| bad("blueprint is not text"))?;
         let bp = Blueprint::parse(text).ok_or_else(|| bad("blueprint is corrupt"))?;
+        // The text blueprint was never checked against its own root, so a
+        // damaged one could name any chunk and still restore "successfully".
+        if Blueprint::compute_root(&bp.files) != bp.root {
+            return Err(bad("blueprint does not match its root"));
+        }
+        let tree = indexed_files(&bp)
+            .ok_or_else(|| bad("index references a chunk it does not carry"))?;
         let list = bp.chunks.iter().map(|c| c.hash.clone()).collect();
-        (chunk_lengths(&bp), indexed_files(&bp), Some(list), Some(bp))
+        (chunk_lengths(&bp), tree, Some(list), Some(bp))
     } else {
         return Err(bad("archive has no index"));
     };
@@ -456,20 +465,29 @@ fn chunk_lengths(bp: &Blueprint) -> Vec<u64> {
 }
 
 /// A blueprint's tree with its hashes replaced by chunk positions.
-fn indexed_files(bp: &Blueprint) -> Vec<IndexedFile> {
-    bp.files
-        .iter()
-        .map(|f| IndexedFile {
+///
+/// `None` when a file names a chunk the archive does not carry. That has to be
+/// an error and never a default: falling back to position zero would hand the
+/// file whatever chunk happened to come first and call the restore a success.
+fn indexed_files(bp: &Blueprint) -> Option<Vec<IndexedFile>> {
+    let mut position: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for (i, chunk) in bp.chunks.iter().enumerate() {
+        position.insert(chunk.hash.as_str(), i);
+    }
+    let mut out = Vec::with_capacity(bp.files.len());
+    for f in &bp.files {
+        let mut pieces = Vec::with_capacity(f.pieces.len());
+        for p in &f.pieces {
+            pieces.push(*position.get(p.hash.as_str())?);
+        }
+        out.push(IndexedFile {
             len: f.len,
             ctype: f.ctype.clone(),
             path: f.path.clone(),
-            pieces: f
-                .pieces
-                .iter()
-                .map(|p| bp.chunks.iter().position(|c| c.hash == p.hash).unwrap_or(0))
-                .collect(),
-        })
-        .collect()
+            pieces,
+        });
+    }
+    Some(out)
 }
 
 /// The `CARTARC 2` index: chunk lengths and the tree, with every hash.
@@ -779,6 +797,72 @@ mod tests {
         assert_eq!(back2, bp);
         assert_eq!(chunks2.len(), bp.chunks.len());
         assert_eq!(map2, map);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A `CARTARC 1` archive: the format older builds wrote, blueprint as text.
+    fn write_v1(path: &std::path::Path, bp: &Blueprint, packed: &[u8]) {
+        let text = bp.text();
+        let mut file = Vec::new();
+        file.extend_from_slice(b"CARTARC 1\n");
+        file.extend_from_slice(format!("epoch {}\nroot {}\n", bp.epoch, bp.root).as_bytes());
+        file.extend_from_slice(format!("blueprint {}\n", text.len()).as_bytes());
+        file.extend_from_slice(b"netmap 0\n");
+        file.extend_from_slice(format!("data {}\n", packed.len()).as_bytes());
+        file.extend_from_slice(text.as_bytes());
+        file.extend_from_slice(packed);
+        fs::write(path, &file).unwrap();
+    }
+
+    #[test]
+    fn a_piece_naming_a_chunk_the_archive_lacks_is_refused() {
+        // A damaged old blueprint can name a chunk the archive does not hold.
+        // Restoring that must fail: handing the file chunk zero and reporting
+        // success is exactly how corrupt data gets published.
+        let base = scratch("chunk0");
+        let (bp, store) = release(&base, 3);
+        let mut raw = Vec::new();
+        for chunk in &bp.chunks {
+            raw.extend_from_slice(&store.get(&chunk.hash).unwrap());
+        }
+        let packed = gzip::gzip(&raw);
+
+        let mut broken = bp.clone();
+        broken.files[0].pieces[0].hash = "11".repeat(32);
+        // Keep the root consistent with the damaged tree, so the missing chunk
+        // is the only thing that gives it away.
+        broken.root = Blueprint::compute_root(&broken.files);
+        assert!(!bp.chunks.iter().any(|c| c.hash == broken.files[0].pieces[0].hash));
+
+        let path = base.join("chunk0.cart");
+        write_v1(&path, &broken, &packed);
+        let err = restore_full(&path).expect_err("a missing chunk must be refused");
+        assert!(err.to_string().contains("does not carry"), "{}", err);
+        assert!(restore(&path).is_err(), "nothing may be handed back");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_old_blueprint_that_does_not_match_its_root_is_refused() {
+        // The text format was trusted as written. A blueprint whose tree no
+        // longer hashes to its root is damaged, and must not restore.
+        let base = scratch("root");
+        let (bp, store) = release(&base, 2);
+        let mut raw = Vec::new();
+        for chunk in &bp.chunks {
+            raw.extend_from_slice(&store.get(&chunk.hash).unwrap());
+        }
+        let packed = gzip::gzip(&raw);
+
+        let mut wrong = bp.clone();
+        let first = if bp.root.starts_with('0') { '1' } else { '0' };
+        wrong.root = format!("{}{}", first, &bp.root[1..]);
+        assert_ne!(wrong.root, bp.root);
+
+        let path = base.join("root.cart");
+        write_v1(&path, &wrong, &packed);
+        let err = restore_full(&path).expect_err("a bad root must be refused");
+        assert!(err.to_string().contains("does not match its root"), "{}", err);
         let _ = fs::remove_dir_all(&base);
     }
 

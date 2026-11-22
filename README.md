@@ -251,7 +251,10 @@ to **6,472 bytes**; the live release (13.6 KB, 5 chunks) went from 5,398 bytes t
 pages (4.1 KB of the 6.4 KB) — there is no index left to squeeze.
 
 `CARTARC 1` (text blueprint, per-chunk hex) and `CARTARC 2` (binary index with
-hashes) are still read, so an archive written by an older build restores here.
+hashes) are still read, so an archive written by an older build restores here —
+and they are held to the same rules: a file that names a chunk the archive does
+not carry, or a tree that no longer hashes to its root, is refused rather than
+restored with the wrong bytes.
 
 ### The zip backup
 
