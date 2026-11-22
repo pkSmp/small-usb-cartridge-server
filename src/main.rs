@@ -29,6 +29,7 @@ mod import;
 mod inflate;
 mod json;
 mod machine;
+mod netmap;
 mod placement;
 mod png;
 mod publish;
@@ -50,6 +51,8 @@ fn usage() -> ! {
          \x20 cluster [--root DIR] [--name ID] [--offset N]   share sites and load with the boxes on the switch\n\
          \x20 fleet [--name ID] [--beacon PORT] [--dns PORT]   share storage and updates with the boxes on the switch\n\
          \x20 fleet status | store | key | archive | adopt   inspect or manage the fleet\n\
+         \x20 fleet map                        the whole network as plain text\n\
+         \x20 fleet zip [FILE]                 every site file as one uncompressed .zip\n\
          \x20 fleet restore FILE               rebuild this box from one archive\n\
          \x20 publish                        copy the live release into RAM\n\
          \x20 import DEVICE                  ingest a cartridge\n\
@@ -260,6 +263,8 @@ fn run_fleet(args: &[String]) -> Result<i32, String> {
         Some("status") => return fleet::status(),
         Some("store") => return fleet::sites_on_disk(),
         Some("archive") => return fleet::archive_now(),
+        Some("map") => return fleet::map_cmd(),
+        Some("zip") => return fleet::zip_now(args.get(1).map(|s| s.as_str())),
         Some("adopt") => return fleet::adopt(),
         Some("restore") => {
             let file = args.get(1).ok_or("fleet restore needs an archive path")?;

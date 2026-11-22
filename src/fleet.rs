@@ -26,6 +26,7 @@ use crate::blueprint::{self, Blueprint};
 use crate::chunks::{self, Store};
 use crate::hash;
 use crate::ident::{self, Identity};
+use crate::netmap;
 use crate::publish;
 use crate::spec::{self, Spec};
 use crate::sys;
@@ -51,6 +52,7 @@ const RELEASES: &str = "/srv/cartridge/releases";
 const LIVE: &str = "/srv/cartridge/live";
 const STORE: &str = "/srv/cartridge/store";
 const ARCHIVE: &str = "/srv/cartridge/archive";
+const NETMAP: &str = "/srv/cartridge/netmap.txt";
 const LOG_FILE: &str = "/var/log/cartridge/fleet.log";
 /// Two copies of cold data by default, three for the blueprint. Rendezvous
 /// moves only about 1/N of the objects when a node joins or leaves.
@@ -86,6 +88,10 @@ fn archive_root() -> PathBuf {
 
 fn state_file() -> PathBuf {
     env_or("CARTRIDGE_FLEET_STATE", STATE_FILE)
+}
+
+fn netmap_path() -> PathBuf {
+    env_or("CARTRIDGE_NETMAP", NETMAP)
 }
 
 extern "C" {
@@ -948,6 +954,7 @@ fn activate(node: &Arc<Node>, epoch: u64) {
         if let Err(e) = publish::run() {
             log("warn", &format!("publish after activation failed: {}", e));
         }
+        apply_boot_art(&dir);
     }
 }
 
@@ -1068,7 +1075,8 @@ fn archive_loop(node: Arc<Node>) {
         let bp2 = bp.clone();
         let store = node.store.clone();
         let node2 = node.clone();
-        match crate::archive::build(&bp2, &store, &path) {
+        let map = netmap_text(&node).unwrap_or_default();
+        match crate::archive::build_with_map(&bp2, &store, &path, &map) {
             Ok(r) => node2.note(format!(
                 "archive for epoch {}: {} -> {}",
                 bp.epoch,
@@ -1200,6 +1208,123 @@ fn state_loop(node: Arc<Node>) {
     }
 }
 
+/// Who should hold each chunk, as box ids rather than internal keys.
+///
+/// Every node computes this from the same plan, so the ids in the map agree
+/// across the fleet without anyone asking anyone.
+fn owned_view(node: &Node, bp: &Blueprint) -> Vec<(String, u64, Vec<u128>)> {
+    let plan = node.plan();
+    let mut by_key: BTreeMap<u64, u128> = BTreeMap::new();
+    by_key.insert(node.me.key(), node.me.id);
+    for member in node.snapshot() {
+        by_key.insert(member.key, member.id);
+    }
+    let mut out = Vec::with_capacity(bp.chunks.len());
+    for chunk in &bp.chunks {
+        let mut ids: Vec<u128> = plan
+            .get(&chunk.hash)
+            .map(|keys| keys.iter().filter_map(|k| by_key.get(k).copied()).collect())
+            .unwrap_or_default();
+        ids.sort_unstable();
+        ids.dedup();
+        out.push((chunk.hash.clone(), chunk.len, ids));
+    }
+    out
+}
+
+/// The whole network as plain text: every box and its name, every file the
+/// cartridge had, and which boxes should hold each chunk.
+fn netmap_text(node: &Node) -> Option<String> {
+    let bp = node.blueprint.lock().unwrap().clone()?;
+    let owned = owned_view(node, &bp);
+    let totals = netmap::totals(&owned);
+    let spec = node.spec.lock().unwrap().clone();
+    let mut boxes = Vec::with_capacity(1 + node.snapshot().len());
+    let (mine_chunks, mine_bytes) = totals.get(&node.me.id).copied().unwrap_or((0, 0));
+    boxes.push(netmap::Box {
+        id: node.me.id,
+        name: node.me.name.clone(),
+        ip: sys::lan_ip(),
+        epoch: node.my_epoch(),
+        ready: node.ready.load(Ordering::Relaxed),
+        busy: node.busy.load(Ordering::Relaxed),
+        weight: spec.weight(),
+        gpu: spec.gpu,
+        ram_mb: spec.ram_total_mb,
+        disk_free_mb: spec.disk_free_mb,
+        owned_chunks: mine_chunks,
+        owned_bytes: mine_bytes,
+        me: true,
+    });
+    for member in node.snapshot() {
+        let (chunks, bytes) = totals.get(&member.id).copied().unwrap_or((0, 0));
+        boxes.push(netmap::Box {
+            id: member.id,
+            name: member.name.clone(),
+            ip: member.ip.to_string(),
+            epoch: member.epoch,
+            ready: member.ready,
+            busy: member.busy,
+            weight: member.spec.weight(),
+            gpu: member.spec.gpu,
+            ram_mb: member.spec.ram_total_mb,
+            disk_free_mb: member.spec.disk_free_mb,
+            owned_chunks: chunks,
+            owned_bytes: bytes,
+            me: false,
+        });
+    }
+    Some(netmap::render(bp.epoch, &bp.root, &boxes, &bp, &owned))
+}
+
+/// Write the map when it changed. Every node writes the same text, so `cmp`
+/// between two boxes is a valid check that they agree on the fleet.
+fn write_netmap(node: &Node) -> Option<PathBuf> {
+    let text = netmap_text(node)?;
+    let path = netmap_path();
+    if fs::read_to_string(&path).map(|old| old == text).unwrap_or(false) {
+        return Some(path);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("new");
+    if fs::write(&tmp, &text).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    }
+    Some(path)
+}
+
+fn netmap_loop(node: Arc<Node>) {
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        write_netmap(&node);
+    }
+}
+
+/// Take the picture the release carries, when it differs from this screen's.
+///
+/// The boot picture travels as an ordinary file of the release, so a stick
+/// inserted in one box sets the logo on every box that adopts that epoch.
+fn apply_boot_art(release: &Path) {
+    let src = release.join("boot.png");
+    if !src.is_file() {
+        return;
+    }
+    let state = "/var/lib/cartridge/boot.png";
+    if crate::hash::same_file(&src.to_string_lossy(), state) {
+        return;
+    }
+    if let Err(e) = fs::copy(&src, state) {
+        log("warn", &format!("could not take boot.png from the release: {}", e));
+        return;
+    }
+    log("art", "boot.png from the release is now this screen's picture");
+    if let Err(e) = crate::bootart::run() {
+        log("warn", &format!("boot art: {}", e));
+    }
+}
+
 /// Start serving. Everything above is pure enough to test; this is the wiring.
 pub fn run(
     root: PathBuf,
@@ -1301,6 +1426,10 @@ pub fn run(
         let node = node.clone();
         std::thread::spawn(move || state_loop(node));
     }
+    {
+        let node = node.clone();
+        std::thread::spawn(move || netmap_loop(node));
+    }
     if let Some(port) = dns_port {
         let node = node.clone();
         std::thread::spawn(move || {
@@ -1344,6 +1473,138 @@ pub fn run(
         std::thread::sleep(Duration::from_secs(30));
         let _ = fs::write(state_file(), node.state_json());
     }
+}
+
+/// Print the network map this box holds. The file itself is the artefact; this
+/// is the first page of it, so nobody has to parse 240-column text by eye.
+/// The map for a box with no fleet daemon: one computer, holding everything it
+/// has. `fleet map` writes it when the daemon has not yet, so a single machine
+/// still has the same file to read and to hand over.
+fn solo_map() -> Option<String> {
+    let store = Store::at(store_root());
+    let bp = fs::read_to_string(store.root().join("blueprint"))
+        .ok()
+        .and_then(|text| Blueprint::parse(&text))?;
+    let me = ident::load_or_create();
+    let owned: Vec<(String, u64, Vec<u128>)> = bp
+        .chunks
+        .iter()
+        .map(|c| (c.hash.clone(), c.len, vec![me.id]))
+        .collect();
+    let totals = netmap::totals(&owned);
+    let (chunks, bytes) = totals.get(&me.id).copied().unwrap_or((0, 0));
+    let boxes = vec![netmap::Box {
+        id: me.id,
+        name: me.name,
+        ip: sys::lan_ip(),
+        epoch: bp.epoch,
+        ready: bp.epoch,
+        busy: 0,
+        weight: 0,
+        gpu: spec::gpu_flag(),
+        ram_mb: crate::machine::mem_total_kb() / 1024,
+        disk_free_mb: 0,
+        owned_chunks: chunks,
+        owned_bytes: bytes,
+        me: true,
+    }];
+    Some(netmap::render(bp.epoch, &bp.root, &boxes, &bp, &owned))
+}
+
+pub fn map_cmd() -> Result<i32, String> {
+    let path = netmap_path();
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => {
+            // No daemon yet: write the single-box map rather than fail.
+            let text = solo_map().ok_or_else(|| {
+                format!("{}: nothing to map yet (no release in the store)", path.display())
+            })?;
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&path, &text);
+            text
+        }
+    };
+    let map = netmap::parse(&text).ok_or("the network map does not parse")?;
+    println!(
+        "{}  epoch {}  {} box(es)  {} file(s)  {} chunk(s)",
+        path.display(),
+        map.epoch,
+        map.boxes.len(),
+        map.files.len(),
+        map.owned.len()
+    );
+    for b in &map.boxes {
+        println!(
+            "  {:<20} {:<15} epoch {:<4} {:>4} chunk(s) {:>9}  {}{}",
+            b.name,
+            b.ip,
+            b.epoch,
+            b.owned_chunks,
+            sys::human(b.owned_bytes),
+            if b.me { "self" } else { "peer" },
+            if b.gpu > 0 { "  gpu" } else { "" }
+        );
+    }
+    Ok(0)
+}
+
+/// Write a real `.zip` of the release: the network map, the blueprint and every
+/// site file, stored rather than deflated. This is the backup to hand to a
+/// person: any unzip opens it, and nothing has to be decoded to restore.
+pub fn zip_now(out: Option<&str>) -> Result<i32, String> {
+    let store = Store::at(store_root());
+    let bp = fs::read_to_string(store.root().join("blueprint"))
+        .ok()
+        .and_then(|text| Blueprint::parse(&text))
+        .ok_or("no blueprint in the store yet")?;
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    entries.push((
+        "netmap.txt".to_string(),
+        fs::read_to_string(netmap_path()).unwrap_or_default().into_bytes(),
+    ));
+    entries.push(("blueprint".to_string(), bp.text().into_bytes()));
+    let live = live_path();
+    if live.is_dir() {
+        collect_files(&live, Path::new(""), &mut entries)
+            .map_err(|e| format!("{}: {}", live.display(), e))?;
+    }
+    let path = match out {
+        Some(p) => PathBuf::from(p),
+        None => archive_root().join(format!("network-{}.zip", bp.epoch)),
+    };
+    let bytes = crate::archive::write_zip(&entries, &path).map_err(|e| e.to_string())?;
+    println!(
+        "{}: {} file(s), {} (epoch {}, {} chunks)",
+        path.display(),
+        entries.len(),
+        sys::human(bytes),
+        bp.epoch,
+        bp.chunks.len()
+    );
+    Ok(0)
+}
+
+fn collect_files(root: &Path, rel: &Path, out: &mut Vec<(String, Vec<u8>)>) -> io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        // The blueprint is stored beside the objects; it is already an entry.
+        if rel.as_os_str().is_empty() && name == ".cartridge" {
+            continue;
+        }
+        let child = rel.join(&name);
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            collect_files(&entry.path(), &child, out)?;
+        } else if meta.is_file() {
+            let bytes = fs::read(entry.path())?;
+            out.push((child.to_string_lossy().replace('\\', "/"), bytes));
+        }
+    }
+    Ok(())
 }
 
 pub fn status() -> Result<i32, String> {
@@ -1405,7 +1666,8 @@ pub fn archive_now() -> Result<i32, String> {
         .and_then(|text| Blueprint::parse(&text))
         .ok_or("no blueprint in the store yet")?;
     let path = archive_root().join(format!("{}.cart", bp.epoch));
-    let report = crate::archive::build(&bp, &store, &path).map_err(|e| e.to_string())?;
+    let map = fs::read_to_string(netmap_path()).unwrap_or_default();
+    let report = crate::archive::build_with_map(&bp, &store, &path, &map).map_err(|e| e.to_string())?;
     println!(
         "{}: {} -> {} ({} chunks)",
         report.path.display(),
@@ -1454,6 +1716,26 @@ mod tests {
             notes: Mutex::new(Vec::new()),
             started: Instant::now(),
         })
+    }
+
+    #[test]
+    fn a_release_carries_its_boot_picture_into_the_tree() {
+        let dir = std::env::temp_dir().join(format!(
+            "cartridge-boot-{}-{}",
+            std::process::id(),
+            ident::random_u128() & 0xffff
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("rel/3000")).unwrap();
+        fs::write(dir.join("rel/3000/index.html"), b"<h1>x</h1>").unwrap();
+        fs::write(dir.join("rel/boot.png"), b"\x89PNG\r\n\x1a\nnot-really").unwrap();
+        let store = Store::at(dir.join("store"));
+        let (bp, _) = chunks::ingest(&dir.join("rel"), &store, None, 3).unwrap();
+        let tree = dir.join("tree");
+        materialize_at(&bp, &store, &tree).unwrap();
+        // apply_boot_art looks for this file after activation.
+        assert!(tree.join("boot.png").is_file());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

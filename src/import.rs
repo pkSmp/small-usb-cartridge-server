@@ -277,6 +277,13 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
                 warn("boot.png unchanged but the art is stale - rebuilding it");
                 art_stale = true;
             }
+        } else if Path::new(&current).is_file()
+            && std::env::var("CARTRIDGE_TAKE_BOOT").map(|v| v != "1").unwrap_or(true)
+        {
+            // The machine already has its own picture. A cartridge that still
+            // carries the demo art must not take it away on every insert;
+            // CARTRIDGE_TAKE_BOOT=1 asks for the cartridge's picture instead.
+            skip("boot.png kept - this machine already has its own picture");
         } else if fs::copy(&boot_src, format!("{}/boot.png.new", STATE)).is_ok() {
             boot_png_new = true;
         } else {

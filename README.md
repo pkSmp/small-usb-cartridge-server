@@ -19,12 +19,15 @@ keeps serving. Web server, import, art and status are all one
 
 | | |
 |---|---|
+| **Your logo stays put** | A cartridge supplies the boot picture only when the machine has none; a stick that still carries the demo art cannot take a chosen logo away on every insert. `CARTRIDGE_TAKE_BOOT=1 cartridge import DEV` asks for the cartridge's picture instead. |
 | **Cartridge in, sites out** | A udev rule runs `cartridge import` on the new block device. The stick is mounted read-only, checked for `config.json`, and published as a new release. |
 | **Served from RAM** | The live release is copied into a tmpfs and served from memory, so a page view never touches the disk. |
 | **Folders are ports** | `3000/` becomes `http://host:3000/`, and a root `index.html` becomes port 80. No config needed. |
 | **Boot art** | `boot.png` is converted to coloured half-block cells (two source rows per cell). A picture bigger than the console is shrunk to the largest size that still fits, keeping its shape and leaving rows for the report below, so any image size works; 1, 2, 4 and 8 bit PNGs are read. Near-black pixels are left blank (grey and dark grey are kept), near-identical shades are merged, and up to 15 non-black palette colours are used. |
 | **No wasted writes** | Files whose name and SHA-256 already match the running release are hard-linked into the new release instead of being written again. Replaying the same stick writes 0 bytes. |
 | **Cluster mode** | Several boxes on the same switch act as one: each broadcasts what it serves and how busy it is, copies a new release from a peer within seconds, and takes the load off a node that already has a connection per core - relayed with `splice(2)`, so the bytes never leave the kernel. |
+| **The network on one page** | Every box writes `/srv/cartridge/netmap.txt`: plain text, uncompressed, the same bytes on every machine. It lists each computer with its auto-generated name, address, epoch, load and GPU presence, every file the cartridge carried, and which computers hold each chunk. Because it is rendered from the beacon list and the ownership plan, it needs no controller and no shared writable file. |
+| **A zip you can open anywhere** | `cartridge fleet zip` writes `network-<epoch>.zip`: the network map, the blueprint and every site file, stored rather than deflated. The solid `.cart` archive stays the small one; the zip is the one a person can hand to someone else. |
 | **Live status screen** | Under the art: the Markdown site table, the machine and staging facts, and the newest import and boot messages as plain text, redrawn four times a second so a line appears as it is logged. Big text uses the brightest colour from the art; small labels use a reserved bright red so they stay readable, falling back to a saturated red or green from the art when no palette slot is free. Storage reports the internal filesystem's actual used and free space, so the OS, the server binary and every installed program are included; the removable cartridge is never counted. |
 
 ## Setup (5 minutes)
@@ -59,7 +62,7 @@ config.json      required; must contain a JSON object, {} is enough
 8080/            -> http://<host>:8080/
 index.html       -> http://<host>/            (port 80)
 www/             not a port of its own
-boot.png         optional; becomes the TV art
+boot.png         optional; becomes the TV art when the machine has none
 README.txt       optional; ignored by the importer
 ```
 
@@ -192,6 +195,53 @@ the slowest node's public port, 16 connections split 1 / 3 / 5 / 7 - in
 proportion to the 1 / 2 / 3 / 4 cores of budget - and 160,000 requests went
 through with no errors at p50 0.38 ms.
 
+## The network on one page
+
+Every node keeps a plain-text map of the whole fleet at
+`/srv/cartridge/netmap.txt`, and rewrites it when anything changes:
+
+```
+CARTNET 1
+epoch 7
+root 294455ec0805d1d2...
+node 2593e760e5b35472ea3d184233f5857f uowpi-nickel-fox 192.168.1.173 7 7 0 4 1 11861 5390 5 13933 self
+node 8a1f...                        b2x9m-slate-otter 192.168.1.174 7 7 3 3 0 8000 40000 3 8112 peer
+file 4710 text/html;_charset=utf-8 3000/index.html
+file 147 application/json 8080/data.json
+own 75f218d31266ee36...  5366 2593e760...,8a1f...
+```
+
+- `node` — one line per computer: id, the auto-generated name (`k7f3q-amber-fox`),
+  address, epoch it is serving, epoch it has ready, connections in flight,
+  placement weight, GPU presence, RAM, free disk, the chunks it is responsible
+  for, and whether that line is this machine.
+- `file` — every file the release carries, with its length and content type.
+- `own` — every chunk, and the ids of the computers that should hold it (two by
+  default). This is what makes the map a storage map and not only a list.
+
+It is rendered from inputs every box already has (the beacons, the blueprint and
+`blueprint::assign`), so all boxes produce byte-identical text — `cmp` between two
+machines is a valid check that they agree — and no file has to be shared or
+written by a controller. A box that was off for a week catches up by rendering it
+again. `cartridge fleet map` prints the summary and the path; on a single machine
+with no daemon running it writes the one-box version first.
+
+### The zip backup
+
+`cartridge fleet zip [FILE]` writes `archive/network-<epoch>.zip` by default:
+`netmap.txt`, `blueprint`, and every site file, **stored** (no deflate) so any
+unzip opens it and nothing has to be decoded. The `.cart` archive remains the
+compressed, solid copy for space; the zip is the one to hand to a person or to
+carry off the box.
+
+### Boot art across the fleet
+
+A release that carries `boot.png` sets the picture on every box that adopts it:
+after activation each node compares it with `/var/lib/cartridge/boot.png`, copies
+it when it differs, and rebuilds and redraws the art. Insert the stick in one
+machine and the logo follows the sites to the others. The file also lives in the
+served tree as `/boot.png`.
+
 ## Where things live
 
 ```
@@ -310,8 +360,9 @@ Honest list, all measured rather than assumed:
   their name, so a box whose clock is badly behind will not adopt a newer
   release; `cartridge status` shows the peers that disagree. Two boxes that both
   hold content published in the same second keep their own copy instead of
-  guessing which is right. Run NTP on the boxes; the sync copies sites but not
-  `boot.png`, because the art is each machine's own screen.
+  guessing which is right. Run NTP on the boxes. The sync copies a release's
+  `boot.png` as well, so a release with a picture sets the art on every node that
+  adopts it; a node whose release has none keeps its own screen.
 
 - **The console font is still loaded by `setfont`.** The kernel refuses the
   `KDFONTOP` unicode-table ioctls here (`EINVAL`), and glyphs without the table map

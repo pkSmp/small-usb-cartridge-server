@@ -212,7 +212,7 @@ fn crc_table() -> [u32; 256] {
     table
 }
 
-fn crc32(data: &[u8]) -> u32 {
+pub fn crc32(data: &[u8]) -> u32 {
     let table = crc_table();
     let mut c = 0xFFFFFFFFu32;
     for &b in data {
