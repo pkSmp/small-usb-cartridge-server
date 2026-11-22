@@ -307,12 +307,13 @@ them.
   and every protocol line have the same caps as a stick, and the archive caps
   decompression at the length its header declares.
 
-Known limits, stated rather than hidden: the CART2 fleet beacon is not signed,
-so a spoofed one can distort the placement map and cause retries (content is
-still verified chunk by chunk); the DNS responder answers any name with the
-fleet's addresses and belongs on a LAN, not the internet; and a release tree may
-contain symlinks (the RAM staging uses them), which the server follows, so a
-release directory must not be writable by anyone else.
+Known limits, stated rather than hidden: with no fleet key the fleet is open by
+design, so set one before a box sits on a shared network; the DNS responder
+answers any name with the fleet's addresses, to its own network only, and
+belongs on a LAN rather than the internet; and a release tree may contain
+symlinks (the RAM staging uses them), which the server follows only inside the
+release and the served root, so a release directory must not be writable by
+anyone else.
 
 ## Where things live
 
