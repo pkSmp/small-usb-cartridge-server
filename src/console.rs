@@ -303,6 +303,59 @@ fn live_target() -> String {
         .unwrap_or_default()
 }
 
+/// Console cells a line really uses: an SGR escape paints no cell.
+fn visible_len(text: &str) -> usize {
+    let mut n = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Cut one line to the console width, keeping escapes whole. A line that runs
+/// past the edge wraps, and a wrap scrolls the screen, which used to push the
+/// whole boot art off the top and leave the report stranded in two places.
+fn fit_width(text: &str, width: usize) -> String {
+    if visible_len(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut n = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            out.push(c);
+            out.push(chars.next().unwrap_or('['));
+            for c2 in chars.by_ref() {
+                out.push(c2);
+                if ('\x40'..='\x7e').contains(&c2) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if n >= width {
+            break;
+        }
+        out.push(c);
+        n += 1;
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
 fn draw_status(cache: &mut Option<Sites>, refresh: bool) {
     let (rows, cols) = terminal_size();
     let heights = fs::read_to_string(ART_ROWS)
@@ -368,11 +421,25 @@ fn draw_status(cache: &mut Option<Sites>, refresh: bool) {
             block.push(theme.paint(Role::Text, &line));
         }
     }
-    block.push(format!(
-        "{}  {}",
-        theme.paint(Role::Dim, "machine"),
-        theme.paint(Role::Text, &machine::summary())
-    ));
+    // The machine line is the long one: wrap it here, with the label on the
+    // first line only, instead of letting it run off the edge of the console.
+    let label = "machine";
+    let room_for_text = cols.saturating_sub(2).max(20).saturating_sub(label.len() + 2).max(10);
+    for (i, part) in wrap(&machine::summary(), room_for_text).into_iter().enumerate() {
+        if i == 0 {
+            block.push(format!(
+                "{}  {}",
+                theme.paint(Role::Dim, label),
+                theme.paint(Role::Text, &part)
+            ));
+        } else {
+            block.push(format!(
+                "{}  {}",
+                " ".repeat(label.len()),
+                theme.paint(Role::Text, &part)
+            ));
+        }
+    }
     if let Some(line) = cluster_line(&theme) {
         block.push(line);
     }
@@ -394,13 +461,19 @@ fn draw_status(cache: &mut Option<Sites>, refresh: bool) {
     }
     block.push(theme.paint(Role::Dim, "login   Ctrl+Alt+F2"));
 
+    // Every write stays inside the report area: the scroll region stops a wrap
+    // from scrolling the art away, and the width cut means there is nothing
+    // left to wrap in the first place.
+    let width = cols.saturating_sub(1).max(20);
+    let top = (h + 2).clamp(1, rows.saturating_sub(1).max(1));
     let mut out = String::new();
-    let mut r = h + 2;
+    out.push_str(&format!("\x1b[{};{}r", top, rows));
+    let mut r = top;
     for line in &block {
         if r > rows {
             break;
         }
-        out.push_str(&format!("\x1b[{};1H\x1b[2K{}\x1b[0m", r, line));
+        out.push_str(&format!("\x1b[{};1H\x1b[2K{}", r, fit_width(line, width)));
         r += 1;
     }
     // Clear any rows a previous, longer report used.

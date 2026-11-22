@@ -577,7 +577,7 @@ pub struct BuildReport {
     pub worst: u8,
 }
 
-pub fn build(img: &Image, cal: &Calib) -> BuildReport {
+pub fn build(img: &Image, cal: &Calib, origin_x: usize) -> BuildReport {
     let mut q = quantise(img);
     let mut weight: Vec<(Rgb, u64)> = Vec::new();
     let mut bottom: Vec<(Rgb, u64)> = Vec::new();
@@ -713,7 +713,9 @@ pub fn build(img: &Image, cal: &Calib) -> BuildReport {
     let mut payload = String::from("\x1b[0m\x1b[?25l");
     let mut expected = Image::new(img.w, img.h);
     for r in 0..rows {
-        payload.push_str(&format!("\x1b[{};1H", r + 1));
+        // Centred by the build: the blank columns are split evenly on both
+        // sides instead of the picture hugging the left edge.
+        payload.push_str(&format!("\x1b[{};{}H", r + 1, origin_x + 1));
         for x in 0..img.w {
             let top = grid[2 * r][x];
             let bot = grid[2 * r + 1][x];
@@ -891,7 +893,13 @@ pub fn cmd_build(image: &str, out: &str) -> Result<i32, String> {
     } else {
         println!("fit: {}x{} px ({}x{} cells) fits the console", img.w, img.h, img.w, img.h.div_ceil(2));
     }
-    let report = build(&img, &cal);
+    // Centre the picture in the console. A narrow image left-aligned on a
+    // 240-column TV leaves a dead band down one side and reads as a mistake.
+    let origin_x = cols.saturating_sub(img.w) / 2;
+    let report = build(&img, &cal, origin_x);
+    if origin_x > 0 {
+        println!("place: row 1, column {} (centred, {} blank each side)", origin_x + 1, origin_x);
+    }
 
     fs::create_dir_all(out).map_err(|e| format!("cannot create {}: {}", out, e))?;
     fs::write(format!("{}/art.bin", out), &report.art).map_err(|e| e.to_string())?;
@@ -913,7 +921,7 @@ pub fn cmd_build(image: &str, out: &str) -> Result<i32, String> {
         ("source".into(), Value::Arr(vec![Value::Num(source.w as f64), Value::Num(source.h as f64)])),
         ("cells".into(), Value::Arr(vec![Value::Num(img.w as f64), Value::Num(report.rows as f64)])),
         ("cell_px".into(), Value::Arr(vec![Value::Num(8.0), Value::Num(16.0)])),
-        ("origin".into(), Value::Arr(vec![Value::Num(0.0), Value::Num(0.0)])),
+        ("origin".into(), Value::Arr(vec![Value::Num(origin_x as f64), Value::Num(0.0)])),
         ("order".into(), Value::Str(cal.order.clone())),
         ("palette".into(), Value::Arr(report.palette.iter().map(|c| Value::Str(hexs(*c))).collect())),
         ("colors".into(), Value::Arr(report.palette.iter().map(|c| Value::Str(hexs(*c))).collect())),
@@ -1014,7 +1022,7 @@ pub fn cmd_verify(map_path: &str) -> Result<i32, String> {
         let cell_row = origin.1 + y / 2;
         let half_top = y % 2 == 0;
         for x in 0..w {
-            let cx = origin.0 + x * cell_px.0;
+            let cx = (origin.0 + x) * cell_px.0;
             let cy = cell_row * cell_px.1 + if half_top { 0 } else { cell_px.1 / 2 };
             let (got, flat) = fb.tile(cx, cy, cell_px.0, cell_px.1 / 2, &order);
             let want = expected.get(x, y);
