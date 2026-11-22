@@ -361,8 +361,23 @@ device, and **measures every task against the CPU on this machine** before using
   trip costs more than the whole frame. `cartridge gpu` prints that dispatch
   cost as its last line and `console` logs the first frame's time, so the claim
   is checkable instead of asserted.
-- The GPU never decides anything by itself: `hash::bytes` asks the offload layer,
-  gets `None` when the CPU won, and hashes as it always did.
+- The cluster and the fleet hand it the same way. Every bulk byte job they do
+  goes through `hash::bytes`: scanning a stick in `import`, scanning a release
+  pulled from a peer, verifying a chunk a peer sent, and re-fetching a lost
+  share in `repair`. On a card that wins the hashing measurement, that scanning
+  and repair runs on the card; on one that loses it, nothing changes. A boot
+  picture that arrives with a release goes through the same `fit`/`tiles` path.
+  Nothing calls the card directly: `hash::bytes` asks the offload layer, gets
+  `None` when the CPU won, and hashes as it always did.
+- The placement decision stays on the CPU, deliberately. Which node holds which
+  chunk is a ranking of `weight / -ln(u)`, and every box has to compute the same
+  order: two boxes that disagree hold different replicas and repair each other
+  forever. A card's `log()` may differ from the CPU's in the last bit, and the
+  whole plan is a few microseconds of arithmetic over a handful of chunks, so a
+  dispatch costs more than the decision it would replace.
+- The fleet's repair loop only runs when the box is not serving: it is the one
+  background job that moves megabytes, and it waits for `busy` to be zero and
+  the CPU pressure to be under 1.0, exactly like the archive.
 
 The service account needs to be in the `render` group to open
 `/dev/dri/renderD128`, and rusticl needs `RUSTICL_ENABLE=iris`; the offload layer

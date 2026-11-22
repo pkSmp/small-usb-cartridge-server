@@ -1052,6 +1052,12 @@ fn commit_loop(node: Arc<Node>) {
 fn repair_loop(node: Arc<Node>) {
     loop {
         std::thread::sleep(REPAIR_EVERY);
+        // A repair fetches and re-hashes chunks, so it is the one loop here that
+        // can move megabytes of disk and CPU. It waits for the box to be idle,
+        // like the archive does, so a busy node never repairs instead of serving.
+        if node.busy.load(Ordering::Relaxed) > 0 || pressure() > 1.0 {
+            continue;
+        }
         let bp = {
             let current = node.blueprint.lock().unwrap().clone();
             match current {
