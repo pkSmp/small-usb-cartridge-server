@@ -130,10 +130,12 @@ impl FrameBuffer {
                     }
                 } else if self.bpp == 16 {
                     let v = self.data[o] as u32 | (self.data[o + 1] as u32) << 8;
+                    // The scaling has to happen in u32: 31 * 255 does not fit a
+                    // u8, and a debug build panics on it.
                     (
-                        ((v >> 11) & 0x1F) as u8 * 255 / 31,
-                        ((v >> 5) & 0x3F) as u8 * 255 / 63,
-                        (v & 0x1F) as u8 * 255 / 31,
+                        (((v >> 11) & 0x1F) * 255 / 31) as u8,
+                        (((v >> 5) & 0x3F) * 255 / 63) as u8,
+                        ((v & 0x1F) * 255 / 31) as u8,
                     )
                 } else {
                     (0, 0, 0)
@@ -846,6 +848,11 @@ fn fit(img: &Image, max_cols: usize, max_rows: usize) -> Image {
     let scale = (max_cols as f64 / img.w as f64).min(max_h as f64 / img.h as f64);
     let nw = ((img.w as f64 * scale).floor() as usize).clamp(1, max_cols);
     let nh = ((img.h as f64 * scale).floor() as usize).clamp(2, max_h);
+    // The reduction is the bulk of a boot build; the card takes it when it has
+    // measured faster, and the bytes are the same either way.
+    if let Some(rgb) = crate::offload::fit_bulk(&img.rgb, img.w, img.h, nw, nh) {
+        return Image { w: nw, h: nh, rgb };
+    }
     let mut out = Image::new(nw, nh);
     for y in 0..nh {
         let y0 = y * img.h / nh;
@@ -1010,13 +1017,33 @@ pub fn cmd_verify(map_path: &str) -> Result<i32, String> {
     let mut worst = 0u8;
     let mut first: Vec<String> = Vec::new();
     let mut screen = Image::new(w, h);
+    // 20k dots of 8x8 pixels is 1.3M framebuffer reads; the card takes them
+    // when it measured faster, and the answers are the same either way.
+    let bulk = crate::offload::tiles_bulk(
+        &fb.data,
+        fb.w,
+        fb.h,
+        fb.stride,
+        fb.bpp,
+        &order,
+        w,
+        h,
+        origin,
+        cell_px,
+    );
     for y in 0..h {
         let cell_row = origin.1 + y / 2;
         let half_top = y % 2 == 0;
         for x in 0..w {
             let cx = origin.0 + x * cell_px.0;
             let cy = cell_row * cell_px.1 + if half_top { 0 } else { cell_px.1 / 2 };
-            let (got, flat) = fb.tile(cx, cy, cell_px.0, cell_px.1 / 2, &order);
+            let (got, flat) = match &bulk {
+                Some(t) => {
+                    let t = &t[y * w + x];
+                    ((t.0, t.1, t.2), t.3)
+                }
+                None => fb.tile(cx, cy, cell_px.0, cell_px.1 / 2, &order),
+            };
             let want = expected.get(x, y);
             screen.put(x, y, got);
             if !flat {

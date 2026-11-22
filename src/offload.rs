@@ -43,6 +43,12 @@ const MEM_COPY_HOST: u64 = 1 << 5;
 
 /// Bulk work has to be worth the round trip; below this the CPU wins outright.
 const MIN_BYTES: usize = 256 * 1024;
+/// The boot art's box-average downscale: a boot picture is 1200x630 or more,
+/// and below this many source pixels one dispatch costs more than the whole
+/// reduction.
+const MIN_FIT_PIXELS: usize = 87_000;
+/// Framebuffer sampling in `art verify`: 240x86 dots of 8x8 pixels is 1.3M.
+const MIN_TILE_PIXELS: usize = 256 * 1024;
 /// The GPU has to be this much faster to be trusted with a task.
 const MARGIN: f64 = 1.2;
 
@@ -140,6 +146,89 @@ __kernel void nearest(__global const uchar *px, uint count,
 }
 "#;
 
+/// Box-average downscale, the same integer arithmetic `art::fit` does: one work
+/// item per output pixel, the source rectangle walked row by row, sums in u64,
+/// so the bytes come out identical to the CPU's.
+const FIT_SRC: &str = r#"
+__kernel void fit(__global const uchar *src, uint sw, uint sh,
+                  uint nw, uint nh, __global uchar *out) {
+    uint x = get_global_id(0);
+    uint y = get_global_id(1);
+    if (x >= nw || y >= nh) return;
+    uint x0 = x * sw / nw;
+    uint x1 = ((x + 1) * sw + nw - 1) / nw;
+    if (x1 > sw) x1 = sw;
+    if (x1 < x0 + 1) x1 = x0 + 1;
+    uint y0 = y * sh / nh;
+    uint y1 = ((y + 1) * sh + nh - 1) / nh;
+    if (y1 > sh) y1 = sh;
+    if (y1 < y0 + 1) y1 = y0 + 1;
+    ulong r = 0, g = 0, b = 0, n = 0;
+    for (uint yy = y0; yy < y1; yy++) {
+        for (uint xx = x0; xx < x1; xx++) {
+            uint o = (yy * sw + xx) * 3;
+            r += src[o]; g += src[o + 1]; b += src[o + 2];
+            n++;
+        }
+    }
+    uint o = (y * nw + x) * 3;
+    out[o] = (uchar)(r / n);
+    out[o + 1] = (uchar)(g / n);
+    out[o + 2] = (uchar)(b / n);
+}
+"#;
+
+/// The tile averages `art::cmd_verify` reads back off the framebuffer: one work
+/// item per sampled dot, the same bounds checks, the same u64 sums, the same
+/// "is this dot flat" test as `art::FrameBuffer::tile`.
+const TILES_SRC: &str = r#"
+__kernel void tiles(__global const uchar *fb, uint fb_len, uint fw, uint fh,
+                    uint stride, uint step, uint bpp, uint bgr,
+                    uint tw, uint th, uint ox, uint oy, uint cw, uint ch,
+                    uint out_w, uint out_h, __global uchar *out) {
+    uint tx = get_global_id(0);
+    uint ty = get_global_id(1);
+    if (tx >= out_w || ty >= out_h) return;
+    uint x0 = ox + tx * cw;
+    uint y0 = oy + (ty / 2) * ch + (ty % 2) * (ch / 2);
+    ulong rs = 0, gs = 0, bs = 0, n = 0;
+    uchar fr = 0, fg = 0, fblue = 0;
+    uint flat = 1;
+    for (uint y = y0; y < y0 + th; y++) {
+        if (y >= fh) continue;
+        for (uint x = x0; x < x0 + tw; x++) {
+            if (x >= fw) continue;
+            uint o = y * stride + x * step;
+            if (o + 2 >= fb_len) continue;
+            uchar r = 0, g = 0, b = 0;
+            if (bpp == 32) {
+                r = bgr ? fb[o] : fb[o + 2];
+                g = fb[o + 1];
+                b = bgr ? fb[o + 2] : fb[o];
+            } else if (bpp == 16) {
+                uint v = (uint)fb[o] | ((uint)fb[o + 1] << 8);
+                r = (uchar)(((v >> 11) & 0x1F) * 255 / 31);
+                g = (uchar)(((v >> 5) & 0x3F) * 255 / 63);
+                b = (uchar)((v & 0x1F) * 255 / 31);
+            }
+            if (n == 0) { fr = r; fg = g; fblue = b; }
+            else if (r != fr || g != fg || b != fblue) flat = 0;
+            rs += r; gs += g; bs += b;
+            n++;
+        }
+    }
+    uint t = (ty * out_w + tx) * 4;
+    if (n == 0) {
+        out[t] = 0; out[t + 1] = 0; out[t + 2] = 0; out[t + 3] = 0;
+        return;
+    }
+    out[t] = (uchar)(rs / n);
+    out[t + 1] = (uchar)(gs / n);
+    out[t + 2] = (uchar)(bs / n);
+    out[t + 3] = (uchar)flat;
+}
+"#;
+
 // -------------------------------------------------------------- function table
 
 struct Fns {
@@ -206,6 +295,8 @@ struct Gpu {
     fns: Fns,
     sha: OnceLock<Option<Kernel>>,
     near: OnceLock<Option<Kernel>>,
+    fit: OnceLock<Option<Kernel>>,
+    tiles: OnceLock<Option<Kernel>>,
     /// A command queue is not safe for concurrent enqueues, so every dispatch
     /// takes this. Bulk work is rare; serialising it costs nothing.
     lock: std::sync::Mutex<()>,
@@ -414,6 +505,175 @@ impl Gpu {
         }
         Some(out)
     }
+
+    fn fit_batch(&self, src: &[u8], sw: usize, sh: usize, nw: usize, nh: usize) -> Option<Vec<u8>> {
+        if sw == 0 || sh == 0 || nw == 0 || nh == 0 {
+            return None;
+        }
+        if src.len() != sw * sh * 3 || sw > u32::MAX as usize || sh > u32::MAX as usize {
+            return None;
+        }
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let kernel = self.kernel(FIT_SRC, "fit", &self.fit)?;
+        let f = &self.fns;
+        let mut err = 0i32;
+        let input = (f.create_buffer)(
+            self.context,
+            MEM_READ_ONLY | MEM_COPY_HOST,
+            src.len(),
+            src.as_ptr() as *mut c_void,
+            &mut err,
+        );
+        let out_len = nw * nh * 3;
+        let output = (f.create_buffer)(self.context, MEM_WRITE_ONLY, out_len, std::ptr::null_mut(), &mut err);
+        if input.is_null() || output.is_null() {
+            return None;
+        }
+        let (sw32, sh32, nw32, nh32) = (sw as u32, sh as u32, nw as u32, nh as u32);
+        (f.set_arg)(kernel, 0, std::mem::size_of::<Mem>(), &input as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 1, 4, &sw32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 2, 4, &sh32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 3, 4, &nw32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 4, 4, &nh32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 5, std::mem::size_of::<Mem>(), &output as *const Mem as *const c_void);
+        let global = [nw, nh];
+        if (f.enqueue)(
+            self.queue,
+            kernel,
+            2,
+            std::ptr::null(),
+            global.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        (f.finish)(self.queue);
+        let mut out = vec![0u8; out_len];
+        if (f.read_buffer)(
+            self.queue,
+            output,
+            1,
+            0,
+            out_len,
+            out.as_mut_ptr() as *mut c_void,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        Some(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tiles_batch(
+        &self,
+        fb: &[u8],
+        fw: usize,
+        fh: usize,
+        stride: usize,
+        bpp: usize,
+        order: &str,
+        tw: usize,
+        th: usize,
+        origin: (usize, usize),
+        cell: (usize, usize),
+        cols: usize,
+        rows: usize,
+    ) -> Option<Vec<(u8, u8, u8, bool)>> {
+        if fb.is_empty() || fw == 0 || fh == 0 || tw == 0 || th == 0 || cols == 0 || rows == 0 {
+            return None;
+        }
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let kernel = self.kernel(TILES_SRC, "tiles", &self.tiles)?;
+        let f = &self.fns;
+        let mut err = 0i32;
+        let input = (f.create_buffer)(
+            self.context,
+            MEM_READ_ONLY | MEM_COPY_HOST,
+            fb.len(),
+            fb.as_ptr() as *mut c_void,
+            &mut err,
+        );
+        let out_len = cols * rows * 4;
+        let output = (f.create_buffer)(self.context, MEM_WRITE_ONLY, out_len, std::ptr::null_mut(), &mut err);
+        if input.is_null() || output.is_null() {
+            return None;
+        }
+        let fb_len32 = fb.len() as u32;
+        let fw32 = fw as u32;
+        let fh32 = fh as u32;
+        let stride32 = stride as u32;
+        let step32 = (bpp / 8) as u32;
+        let bpp32 = bpp as u32;
+        let bgr32 = (order == "bgr") as u32;
+        let tw32 = tw as u32;
+        let th32 = th as u32;
+        let ox32 = origin.0 as u32;
+        let oy32 = origin.1 as u32;
+        let cw32 = cell.0 as u32;
+        let ch32 = cell.1 as u32;
+        let cols32 = cols as u32;
+        let rows32 = rows as u32;
+        (f.set_arg)(kernel, 0, std::mem::size_of::<Mem>(), &input as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 1, 4, &fb_len32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 2, 4, &fw32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 3, 4, &fh32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 4, 4, &stride32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 5, 4, &step32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 6, 4, &bpp32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 7, 4, &bgr32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 8, 4, &tw32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 9, 4, &th32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 10, 4, &ox32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 11, 4, &oy32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 12, 4, &cw32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 13, 4, &ch32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 14, 4, &cols32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 15, 4, &rows32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 16, std::mem::size_of::<Mem>(), &output as *const Mem as *const c_void);
+        let global = [cols, rows];
+        if (f.enqueue)(
+            self.queue,
+            kernel,
+            2,
+            std::ptr::null(),
+            global.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        (f.finish)(self.queue);
+        let mut raw = vec![0u8; out_len];
+        if (f.read_buffer)(
+            self.queue,
+            output,
+            1,
+            0,
+            out_len,
+            raw.as_mut_ptr() as *mut c_void,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        Some(
+            raw.chunks_exact(4)
+                .map(|c| (c[0], c[1], c[2], c[3] != 0))
+                .collect(),
+        )
+    }
 }
 
 /// Offload decisions belong in the journal next to everything else, not on a
@@ -592,6 +852,8 @@ fn open() -> Option<Gpu> {
             fns,
             sha: OnceLock::new(),
             near: OnceLock::new(),
+            fit: OnceLock::new(),
+            tiles: OnceLock::new(),
             lock: std::sync::Mutex::new(()),
         })
     }
@@ -633,8 +895,130 @@ pub fn wins(task: &str) -> bool {
     match task {
         "sha256" => sha256_wins(),
         "nearest" => nearest_wins(),
+        "fit" => fit_wins(),
+        "tiles" => tiles_wins(),
         _ => false,
     }
+}
+
+/// The CPU's box average, kept here so the measurement compares the card with
+/// exactly the arithmetic `art::fit` uses.
+fn cpu_fit(src: &[u8], sw: usize, sh: usize, nw: usize, nh: usize) -> Vec<u8> {
+    let mut out = vec![0u8; nw * nh * 3];
+    for y in 0..nh {
+        let y0 = y * sh / nh;
+        let y1 = (((y + 1) * sh).div_ceil(nh)).min(sh).max(y0 + 1);
+        for x in 0..nw {
+            let x0 = x * sw / nw;
+            let x1 = (((x + 1) * sw).div_ceil(nw)).min(sw).max(x0 + 1);
+            let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    let o = (yy * sw + xx) * 3;
+                    r += src[o] as u64;
+                    g += src[o + 1] as u64;
+                    b += src[o + 2] as u64;
+                    n += 1;
+                }
+            }
+            let o = (y * nw + x) * 3;
+            out[o] = (r / n) as u8;
+            out[o + 1] = (g / n) as u8;
+            out[o + 2] = (b / n) as u8;
+        }
+    }
+    out
+}
+
+fn fit_wins() -> bool {
+    static W: OnceLock<bool> = OnceLock::new();
+    *W.get_or_init(|| {
+        let Some(g) = gpu() else {
+            record("fit", "Mpix/s", 0.0, 0.0);
+            return false;
+        };
+        // The real shape of a boot picture: 1200x630 reduced to 240x86 dots.
+        let (sw, sh, nw, nh) = (1200usize, 630usize, 240usize, 86usize);
+        let src: Vec<u8> = (0..sw * sh * 3)
+            .map(|i| ((i * 31 + i / 7) & 0xff) as u8)
+            .collect();
+        let mpix = (sw * sh) as f64 / 1e6;
+        let start = Instant::now();
+        let Some(gpu_out) = g.fit_batch(&src, sw, sh, nw, nh) else {
+            record("fit", "Mpix/s", 0.0, 0.0);
+            return false;
+        };
+        let gpu_secs = start.elapsed().as_secs_f64();
+        let start = Instant::now();
+        let cpu_out = cpu_fit(&src, sw, sh, nw, nh);
+        let cpu_secs = start.elapsed().as_secs_f64();
+        if gpu_out != cpu_out {
+            note("offload: the GPU downscale disagreed with the CPU; staying on the CPU");
+            record("fit", "Mpix/s", 0.0, 0.0);
+            return false;
+        }
+        let g = mpix / gpu_secs.max(1e-9);
+        let c = mpix / cpu_secs.max(1e-9);
+        record("fit", "Mpix/s", g, c);
+        g > c * MARGIN
+    })
+}
+
+fn tiles_wins() -> bool {
+    static W: OnceLock<bool> = OnceLock::new();
+    *W.get_or_init(|| {
+        let Some(g) = gpu() else {
+            record("tiles", "Mpix/s", 0.0, 0.0);
+            return false;
+        };
+        // A 1080p framebuffer sampled the way `art verify` samples it.
+        let (fw, fh) = (1920usize, 1080usize);
+        let stride = fw * 4;
+        let data: Vec<u8> = (0..stride * fh).map(|i| ((i * 13 + i / 5) & 0xff) as u8).collect();
+        let (cols, rows, cell) = (240usize, 86usize, (8usize, 16usize));
+        let (tw, th) = (cell.0, cell.1 / 2);
+        let mpix = (cols * rows * tw * th) as f64 / 1e6;
+        let start = Instant::now();
+        let Some(gpu_out) = g.tiles_batch(
+            &data,
+            fw,
+            fh,
+            stride,
+            32,
+            "bgr",
+            tw,
+            th,
+            (0, 0),
+            cell,
+            cols,
+            rows,
+        ) else {
+            record("tiles", "Mpix/s", 0.0, 0.0);
+            return false;
+        };
+        let gpu_secs = start.elapsed().as_secs_f64();
+        let fb = crate::art::FrameBuffer { w: fw, h: fh, bpp: 32, stride, data: data.clone() };
+        let start = Instant::now();
+        let mut cpu_out = Vec::with_capacity(cols * rows);
+        for y in 0..rows {
+            for x in 0..cols {
+                let cx = x * cell.0;
+                let cy = (y / 2) * cell.1 + (y % 2) * (cell.1 / 2);
+                let (got, flat) = fb.tile(cx, cy, tw, th, "bgr");
+                cpu_out.push((got.0, got.1, got.2, flat));
+            }
+        }
+        let cpu_secs = start.elapsed().as_secs_f64();
+        if gpu_out != cpu_out {
+            note("offload: the GPU tile sampling disagreed with the CPU; staying on the CPU");
+            record("tiles", "Mpix/s", 0.0, 0.0);
+            return false;
+        }
+        let g = mpix / gpu_secs.max(1e-9);
+        let c = mpix / cpu_secs.max(1e-9);
+        record("tiles", "Mpix/s", g, c);
+        g > c * MARGIN
+    })
 }
 
 fn sha256_wins() -> bool {
@@ -753,12 +1137,71 @@ pub fn sha256_bulk(data: &[u8]) -> Option<[u8; 32]> {
     Some(hashes[0])
 }
 
+/// The boot art's box-average downscale, on the card when the card has won
+/// that task. `None` means the caller does its own loop, which is the usual
+/// answer on a small picture.
+pub fn fit_bulk(src: &[u8], sw: usize, sh: usize, nw: usize, nh: usize) -> Option<Vec<u8>> {
+    if sw.saturating_mul(sh) < MIN_FIT_PIXELS || !fit_wins() {
+        return None;
+    }
+    gpu()?.fit_batch(src, sw, sh, nw, nh)
+}
+
+/// The framebuffer sampling `art verify` does, on the card when it wins.
+#[allow(clippy::too_many_arguments)]
+pub fn tiles_bulk(
+    fb: &[u8],
+    fw: usize,
+    fh: usize,
+    stride: usize,
+    bpp: usize,
+    order: &str,
+    cols: usize,
+    rows: usize,
+    origin: (usize, usize),
+    cell: (usize, usize),
+) -> Option<Vec<(u8, u8, u8, bool)>> {
+    if fw.saturating_mul(fh) < MIN_TILE_PIXELS || !tiles_wins() {
+        return None;
+    }
+    gpu()?.tiles_batch(
+        fb,
+        fw,
+        fh,
+        stride,
+        bpp,
+        order,
+        cell.0,
+        cell.1 / 2,
+        origin,
+        cell,
+        cols,
+        rows,
+    )
+}
+
+/// What one dispatch costs, transfer and wait included. Text is a few hundred
+/// bytes a second, so this is the number that keeps it on the CPU.
+pub fn dispatch_micros() -> Option<f64> {
+    let g = gpu()?;
+    let pixels = vec![[0u8, 0, 0]; 1];
+    let palette = vec![[0u8, 0, 0], [255u8, 255, 255]];
+    g.nearest_batch(&pixels, &palette)?;
+    let start = Instant::now();
+    for _ in 0..8 {
+        g.nearest_batch(&pixels, &palette)?;
+    }
+    Some(start.elapsed().as_secs_f64() * 1e6 / 8.0)
+}
+
 /// The measured table, one line per task, for `cartridge gpu` and the logs.
 pub fn report() -> String {
     // Measure everything that is registered, so the table is complete even on a
     // box that has never imported a cartridge.
     let _ = sha256_wins();
     let _ = nearest_wins();
+    let _ = fit_wins();
+    let _ = tiles_wins();
     let mut out = String::new();
     match available() {
         Some(card) => out.push_str(&format!("offload: {}\n", card)),
@@ -771,6 +1214,12 @@ pub fn report() -> String {
         out.push_str(&format!(
             "  {:<8} gpu {:>9.1} {:<7} cpu {:>9.1} {:<7} -> {}\n",
             v.task, v.gpu, v.unit, v.cpu, v.unit, pick
+        ));
+    }
+    if let Some(us) = dispatch_micros() {
+        out.push_str(&format!(
+            "  dispatch ~{:.0} us per round trip; the console's text is a few hundred bytes a second\n",
+            us
         ));
     }
     out
@@ -806,6 +1255,45 @@ mod tests {
             let mut h = crate::hash::Sha256::new();
             h.update(m);
             assert_eq!(got[i], h.finish(), "message {} differs", i);
+        }
+    }
+
+    #[test]
+    fn the_downscale_agrees_with_the_cpu() {
+        let Some(g) = gpu() else {
+            return;
+        };
+        let (sw, sh, nw, nh) = (320usize, 180usize, 80usize, 45usize);
+        let src: Vec<u8> = (0..sw * sh * 3).map(|i| ((i * 17 + i / 3) & 0xff) as u8).collect();
+        let Some(got) = g.fit_batch(&src, sw, sh, nw, nh) else {
+            return; // the driver refused the kernel; the CPU keeps the work
+        };
+        assert_eq!(got, cpu_fit(&src, sw, sh, nw, nh));
+    }
+
+    #[test]
+    fn tile_sampling_agrees_with_the_framebuffer() {
+        let Some(g) = gpu() else {
+            return;
+        };
+        let (fw, fh) = (640usize, 360usize);
+        let stride = fw * 4;
+        let data: Vec<u8> = (0..stride * fh).map(|i| ((i * 7 + i / 11) & 0xff) as u8).collect();
+        let cell = (8usize, 16usize);
+        let (cols, rows) = (80usize, 45usize);
+        let Some(got) = g.tiles_batch(&data, fw, fh, stride, 32, "bgr", 8, 8, (0, 0), cell, cols, rows)
+        else {
+            return;
+        };
+        let fb = crate::art::FrameBuffer { w: fw, h: fh, bpp: 32, stride, data };
+        for y in 0..rows {
+            for x in 0..cols {
+                let cy = (y / 2) * cell.1 + (y % 2) * (cell.1 / 2);
+                let (want, flat) = fb.tile(x * cell.0, cy, 8, 8, "bgr");
+                let t = got[y * cols + x];
+                assert_eq!((t.0, t.1, t.2), want, "dot ({},{}) differs", x, y);
+                assert_eq!(t.3, flat, "dot ({},{}) flatness differs", x, y);
+            }
         }
     }
 

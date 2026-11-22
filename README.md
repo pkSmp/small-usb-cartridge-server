@@ -336,10 +336,24 @@ device, and **measures every task against the CPU on this machine** before using
     nearest  gpu      48.7 Mpix/s  cpu      14.5 Mpix/s  -> gpu
   ```
 
+  The same table gains a `fit` and a `tiles` row on a box with a card; every row
+  is measured on that machine, not carried over from this one.
+
   Bulk hashing stays on the CPU there, so `import` and `restore` are untouched.
   Palette mapping wins 3.4x, so any image large enough to be worth a dispatch
-  goes to the card; the boot art is about 12k pixels, below that line, which is
-  why the console still maps it on the CPU.
+  goes to the card.
+- The boot art is the card's other job, and all of it stays optional: `fit` is
+  the box-average reduction from the picture down to the console grid (a
+  1200x630 boot image is 750k source pixels, well past what one dispatch costs)
+  and `tiles` is the framebuffer sampling `art verify` reads back to prove the
+  draw. Both keep the CPU's exact u64 arithmetic and are compared with the CPU's
+  own loop byte for byte before the card is trusted, so `art build` writes the
+  same `art.bin` and `art verify` reports the same dots whichever engine ran.
+- The console's text stays on the CPU, and the table says why: a status frame is
+  a couple of kilobytes of escape codes once a second, and one dispatch round
+  trip costs more than the whole frame. `cartridge gpu` prints that dispatch
+  cost as its last line and `console` logs the first frame's time, so the claim
+  is checkable instead of asserted.
 - The GPU never decides anything by itself: `hash::bytes` asks the offload layer,
   gets `None` when the CPU won, and hashes as it always did.
 

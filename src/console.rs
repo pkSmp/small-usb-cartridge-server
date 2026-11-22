@@ -311,6 +311,7 @@ pub fn run() -> Result<i32, String> {
     }
 
     let mut log_pos = fs::metadata(IMPORT_LOG).map(|m| m.len()).unwrap_or(0);
+    let mut timed = false;
 
     loop {
         if !console_ok && probe_console() {
@@ -318,7 +319,15 @@ pub fn run() -> Result<i32, String> {
         }
         // Redraw every second so USB and release changes appear.
         if art_done() {
+            let start = std::time::Instant::now();
             draw_status();
+            if !timed {
+                timed = true;
+                log_line(&format!(
+                    "text: one status frame took {} us on the cpu",
+                    start.elapsed().as_micros()
+                ));
+            }
         }
 
         // Mirror new import-log lines into the console log (the old tail -F).
