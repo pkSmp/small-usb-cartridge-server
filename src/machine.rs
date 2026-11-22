@@ -125,6 +125,56 @@ pub fn staging() -> (u64, u64, u64, u64) {
     (total, ram, total.saturating_sub(ram), 0)
 }
 
+/// Every network interface except loopback, with its link state and the speed
+/// the kernel negotiated: "eno0 1.0 Gb/s", "wlp2s0 up", "eno0 down".
+fn links() -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir("/sys/class/net")
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        if name == "lo" {
+            continue;
+        }
+        let base = format!("/sys/class/net/{}", name);
+        let state = fs::read_to_string(format!("{}/operstate", base))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        // A wired link only reports its speed while it is up, and wifi has no
+        // speed file at all, so the link state is what is left to show there.
+        let speed = fs::read_to_string(format!("{}/speed", base))
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|m| *m > 0);
+        out.push(match (state.as_str(), speed) {
+            ("up", Some(m)) => format!("{} {}", name, speed_text(m)),
+            ("up", None) => format!("{} up", name),
+            ("", _) => name,
+            (s, _) => format!("{} {}", name, s),
+        });
+    }
+    out
+}
+
+/// 1000 Mb/s reads as 1 Gb/s; anything slower stays in Mb/s.
+fn speed_text(mbps: i64) -> String {
+    if mbps >= 1000 {
+        let gb = mbps as f64 / 1000.0;
+        if (gb - gb.round()).abs() < 0.05 {
+            format!("{:.0} Gb/s", gb)
+        } else {
+            format!("{:.1} Gb/s", gb)
+        }
+    } else {
+        format!("{} Mb/s", mbps)
+    }
+}
+
 /// One line for the log, the console and `status`.
 pub fn summary() -> String {
     let (drives, capacity) = hardware();
@@ -141,14 +191,33 @@ pub fn summary() -> String {
     } else {
         format!("{} internal storage (usage unavailable)", sys::human(capacity))
     };
+    let net = links();
     format!(
-        "{} internal drive(s), {} · {} RAM · sites {} ({} in RAM, {} on disk) · {}",
+        "{} internal drive(s), {} · {} RAM · sites {} ({} in RAM, {} on disk) · {}{}",
         drives,
         storage,
         sys::human(ram_total),
         sys::human(total),
         sys::human(ram),
         sys::human(disk),
-        if disk == 0 { "all sites fit in RAM" } else { "not all sites fit in RAM" }
+        if disk == 0 { "all sites fit in RAM" } else { "not all sites fit in RAM" },
+        if net.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", net.join(", "))
+        }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::speed_text;
+
+    #[test]
+    fn wired_speeds_read_in_the_right_unit() {
+        assert_eq!(speed_text(100), "100 Mb/s");
+        assert_eq!(speed_text(1000), "1 Gb/s");
+        assert_eq!(speed_text(2500), "2.5 Gb/s");
+        assert_eq!(speed_text(10000), "10 Gb/s");
+    }
 }
