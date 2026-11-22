@@ -1,0 +1,6 @@
+{
+  "message": "JavaScript and fetch are working.",
+  "cartridge": "usb-cartridge",
+  "port": 8080,
+  "served_from": "a RAM copy of the release"
+}

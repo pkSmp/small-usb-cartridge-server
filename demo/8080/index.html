@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Runtime · port 8080</title>
+<style>
+  :root{--ink:#1b1718;--muted:#6b6265;--paper:#f7f4f0;--line:#ddd5cc;--accent:#990030;--code:#f0eae3}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);padding:3rem 1.25rem;
+       font:16px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+  main{max-width:52rem;margin:0 auto}
+  header{border-bottom:3px double var(--line);padding-bottom:1.1rem;margin-bottom:2rem}
+  .brand{font:600 .72rem/1 ui-monospace,monospace;letter-spacing:.22em;text-transform:uppercase;color:var(--accent)}
+  h1{font-size:clamp(1.8rem,5vw,2.4rem);letter-spacing:-.02em;margin:.6rem 0 .35rem;font-weight:650}
+  .lede{color:var(--muted);margin:0;max-width:42rem}
+  h2{font-size:.78rem;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+     margin:2.4rem 0 .7rem;padding-bottom:.4rem;border-bottom:1px solid var(--line)}
+  table{width:100%;border-collapse:collapse;font-size:.95rem;font-variant-numeric:tabular-nums}
+  th{text-align:left;font:600 .68rem/1.4 ui-monospace,monospace;letter-spacing:.13em;
+     text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--ink);padding:.5rem .6rem}
+  td{border-bottom:1px solid var(--line);padding:.6rem;vertical-align:top}
+  tr:hover td{background:#fbf9f6}
+  .num{text-align:right}
+  code{font:.88em/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);
+       padding:.12em .35em;border-radius:4px;white-space:nowrap}
+  pre{background:#1b1416;color:#f4e9ee;padding:1rem 1.15rem;border-radius:.55rem;overflow:auto;
+      font:13px/1.6 ui-monospace,monospace}
+  pre code{background:none;padding:0;color:inherit;white-space:pre}
+  .clock{font:600 1.5rem/1.2 ui-monospace,monospace;font-variant-numeric:tabular-nums;letter-spacing:.02em}
+  .dot{display:inline-block;width:.5rem;height:.5rem;background:#1f7a3d;border-radius:50%;
+       margin-right:.45rem;box-shadow:0 0 0 3px #1f7a3d22}
+  .muted{color:var(--muted)}
+  footer{margin-top:3rem;border-top:1px solid var(--line);padding-top:.9rem;color:var(--muted);
+         font:.78rem/1.6 ui-monospace,monospace;display:flex;justify-content:space-between;
+         flex-wrap:wrap;gap:.5rem}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">usb cartridge · port 8080</div>
+    <h1>Runtime</h1>
+    <p class="lede">What this machine is doing right now: a clock from the browser, and values
+      fetched from <code>data.json</code> next to this file.</p>
+  </header>
+
+  <h2>Live</h2>
+  <table>
+    <thead><tr><th>Value</th><th>Reading</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Local time</td>
+        <td><span class="clock" id="clock">--:--:--</span></td>
+        <td><code class="muted">Date()</code> in the browser</td>
+      </tr>
+      <tr>
+        <td>Message</td>
+        <td id="message"><span class="dot"></span>loading <code>data.json</code> …</td>
+        <td><code>data.json</code></td>
+      </tr>
+      <tr>
+        <td>Cartridge</td>
+        <td id="cartridge" class="muted">—</td>
+        <td><code>data.json</code></td>
+      </tr>
+      <tr>
+        <td>Port</td>
+        <td id="port" class="muted">—</td>
+        <td><code>data.json</code></td>
+      </tr>
+      <tr>
+        <td>Served from</td>
+        <td id="storage" class="muted">—</td>
+        <td><code>data.json</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>The whole mechanism</h2>
+  <pre><code>function tick() {
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString();
+}
+tick(); setInterval(tick, 1000);
+
+fetch('data.json')
+  .then(r =&gt; r.json())
+  .then(d =&gt; {
+    document.getElementById('message').textContent = d.message;
+    document.getElementById('cartridge').textContent = d.cartridge;
+    document.getElementById('port').textContent = d.port;
+    document.getElementById('storage').textContent = d.served_from;
+  });</code></pre>
+
+  <h2>data.json</h2>
+  <table>
+    <thead><tr><th>Key</th><th>Type</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>message</code></td><td>string</td><td>short human sentence shown above</td></tr>
+      <tr><td><code>cartridge</code></td><td>string</td><td>name of the stick this came from</td></tr>
+      <tr><td><code>port</code></td><td>number</td><td>port this folder is served on</td></tr>
+      <tr><td><code>served_from</code></td><td>string</td><td>where the bytes are read from</td></tr>
+    </tbody>
+  </table>
+
+  <footer>
+    <span>static files · no backend</span>
+    <span>http://&lt;server&gt;:8080</span>
+  </footer>
+</main>
+<script>
+  function tick() {
+    document.getElementById('clock').textContent = new Date().toLocaleTimeString();
+  }
+  tick();
+  setInterval(tick, 1000);
+  fetch('data.json')
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      document.getElementById('message').textContent = d.message;
+      document.getElementById('cartridge').textContent = d.cartridge;
+      document.getElementById('port').textContent = d.port;
+      document.getElementById('storage').textContent = d.served_from;
+    })
+    .catch(function (e) {
+      document.getElementById('message').textContent = 'data.json failed: ' + e;
+    });
+</script>
+</body>
+</html>

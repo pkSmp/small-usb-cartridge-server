@@ -73,6 +73,11 @@ fn the_tree_contains_only_rust() {
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
+        // `demo/` is a USB stick in a folder: its HTML, JSON and text are the
+        // content the server serves, not code in another language.
+        if rel.starts_with("demo/") && matches!(ext.as_str(), "html" | "json" | "txt" | "png") {
+            continue;
+        }
         if !ALLOWED_EXT.contains(&ext.as_str()) {
             offenders.push(rel);
         }

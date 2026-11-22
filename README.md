@@ -86,6 +86,15 @@ README.txt       optional; ignored by the importer
 The folders are the configuration. A stick without `config.json` is left alone,
 so an ordinary USB drive is never imported by accident.
 
+A working cartridge with exactly this layout is in `demo/`: three sites, a
+boot picture and an empty `config.json`. Its contents are the release asset,
+stored at the top level of the zip so the archive extracts straight onto the
+root of a stick:
+
+```
+cd demo && zip -r -X ../usb-demo-cartridge.zip .
+```
+
 ## Cluster mode
 
 Several of these boxes on one switch behave as a single server: insert the

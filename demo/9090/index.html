@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JSON endpoint · port 9090</title>
+<style>
+  :root{--ink:#1b1718;--muted:#6b6265;--paper:#f7f4f0;--line:#ddd5cc;--accent:#990030;--code:#f0eae3}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);padding:3rem 1.25rem;
+       font:16px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+  main{max-width:52rem;margin:0 auto}
+  header{border-bottom:3px double var(--line);padding-bottom:1.1rem;margin-bottom:2rem}
+  .brand{font:600 .72rem/1 ui-monospace,monospace;letter-spacing:.22em;text-transform:uppercase;color:var(--accent)}
+  h1{font-size:clamp(1.8rem,5vw,2.4rem);letter-spacing:-.02em;margin:.6rem 0 .35rem;font-weight:650}
+  .lede{color:var(--muted);margin:0;max-width:42rem}
+  h2{font-size:.78rem;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+     margin:2.4rem 0 .7rem;padding-bottom:.4rem;border-bottom:1px solid var(--line)}
+  table{width:100%;border-collapse:collapse;font-size:.95rem}
+  th{text-align:left;font:600 .68rem/1.4 ui-monospace,monospace;letter-spacing:.13em;
+     text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--ink);padding:.5rem .6rem}
+  td{border-bottom:1px solid var(--line);padding:.55rem .6rem;vertical-align:top}
+  tr:hover td{background:#fbf9f6}
+  code{font:.88em/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);
+       padding:.12em .35em;border-radius:4px;white-space:nowrap}
+  pre{background:#1b1416;color:#f4e9ee;padding:1rem 1.15rem;border-radius:.55rem;overflow:auto;
+      font:13px/1.6 ui-monospace,monospace}
+  pre code{background:none;padding:0;color:inherit;white-space:pre}
+  a{color:var(--accent)}
+  footer{margin-top:3rem;border-top:1px solid var(--line);padding-top:.9rem;color:var(--muted);
+         font:.78rem/1.6 ui-monospace,monospace;display:flex;justify-content:space-between;
+         flex-wrap:wrap;gap:.5rem}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">usb cartridge · port 9090</div>
+    <h1>JSON endpoint</h1>
+    <p class="lede">A folder of files is already an API. This page fetches
+      <code><a href="data.json">data.json</a></code> and prints it unchanged.</p>
+  </header>
+
+  <h2>Response</h2>
+  <table>
+    <thead><tr><th>Key</th><th>Value</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>ok</code></td><td><code>true</code></td><td>the endpoint answered</td></tr>
+      <tr><td><code>ports</code></td><td><code>[3000, 8080, 9090]</code></td><td>sites on this cartridge</td></tr>
+      <tr><td><code>storage</code></td><td><code>"served from tmpfs (RAM)"</code></td><td>where the bytes live</td></tr>
+      <tr><td><code>backend</code></td><td><code>"none - these are plain files"</code></td><td>no server process per site</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Raw</h2>
+  <pre><code id="out">loading …</code></pre>
+
+  <h2>Use it</h2>
+  <pre><code>curl -s http://&lt;server&gt;:9090/data.json | jq .
+fetch('http://&lt;server&gt;:9090/data.json').then(r =&gt; r.json())</code></pre>
+
+  <footer>
+    <span>static file · application/json</span>
+    <span>http://&lt;server&gt;:9090</span>
+  </footer>
+</main>
+<script>
+  fetch('data.json')
+    .then(function (r) { return r.text(); })
+    .then(function (t) {
+      document.getElementById('out').textContent = t.trim();
+    })
+    .catch(function (e) {
+      document.getElementById('out').textContent = 'data.json failed: ' + e;
+    });
+</script>
+</body>
+</html>

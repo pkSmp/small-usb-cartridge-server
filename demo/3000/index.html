@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cartridge Server · Reference</title>
+<style>
+  :root{--ink:#1b1718;--muted:#6b6265;--paper:#f7f4f0;--line:#ddd5cc;--accent:#990030;--code:#f0eae3}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);padding:3rem 1.25rem;
+       font:16px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+  main{max-width:58rem;margin:0 auto}
+  header{border-bottom:3px double var(--line);padding-bottom:1.1rem;margin-bottom:2rem}
+  .brand{font:600 .72rem/1 ui-monospace,monospace;letter-spacing:.22em;text-transform:uppercase;color:var(--accent)}
+  h1{font-size:clamp(1.9rem,5vw,2.6rem);letter-spacing:-.02em;margin:.6rem 0 .35rem;font-weight:650}
+  .lede{color:var(--muted);margin:0;max-width:44rem}
+  h2{font-size:.78rem;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+     margin:2.6rem 0 .7rem;padding-bottom:.4rem;border-bottom:1px solid var(--line)}
+  table{width:100%;border-collapse:collapse;font-size:.95rem;font-variant-numeric:tabular-nums}
+  th{text-align:left;font:600 .68rem/1.4 ui-monospace,monospace;letter-spacing:.13em;
+     text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--ink);padding:.5rem .6rem}
+  td{border-bottom:1px solid var(--line);padding:.55rem .6rem;vertical-align:top}
+  tr:hover td{background:#fbf9f6}
+  .num{text-align:right}
+  code{font:.88em/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);
+       padding:.12em .35em;border-radius:4px;white-space:nowrap}
+  code.path{white-space:normal;overflow-wrap:anywhere}
+  pre{background:#1b1416;color:#f4e9ee;padding:1rem 1.15rem;border-radius:.55rem;overflow:auto;
+      font:13px/1.6 ui-monospace,monospace}
+  pre code{background:none;padding:0;color:inherit;white-space:pre}
+  blockquote{margin:1.25rem 0;padding:.6rem 1rem;border-left:3px solid var(--accent);
+             background:#f1e9e6;color:#4a3a3e}
+  .tick{color:#1f7a3d;font-weight:700}
+  footer{margin-top:3rem;border-top:1px solid var(--line);padding-top:.9rem;color:var(--muted);
+         font:.78rem/1.6 ui-monospace,monospace;display:flex;justify-content:space-between;
+         flex-wrap:wrap;gap:.5rem}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">usb cartridge · port 3000</div>
+    <h1>Cartridge Server</h1>
+    <p class="lede">A read-only USB stick, served from memory. One folder per port, no build
+      step, no JavaScript required on this page.</p>
+  </header>
+
+  <h2>Ports</h2>
+  <table>
+    <thead>
+      <tr><th class="num">Port</th><th>Folder</th><th>Serves</th><th>State</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="num"><code>3000</code></td><td><code>3000/</code></td><td>This reference page</td><td><span class="tick">✓</span> live</td></tr>
+      <tr><td class="num"><code>8080</code></td><td><code>8080/</code></td><td>Runtime monitor, live clock and <code>data.json</code></td><td><span class="tick">✓</span> live</td></tr>
+      <tr><td class="num"><code>9090</code></td><td><code>9090/</code></td><td>Plain JSON endpoint</td><td><span class="tick">✓</span> live</td></tr>
+    </tbody>
+  </table>
+
+  <h2>How a folder becomes a port</h2>
+  <table>
+    <thead><tr><th>Rule</th><th>Example</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>A folder named only with digits</td><td><code>3000/index.html</code></td><td><code>http://&lt;server&gt;:3000/</code></td></tr>
+      <tr><td>Any file inside that folder</td><td><code>8080/data.json</code></td><td><code>http://&lt;server&gt;:8080/data.json</code></td></tr>
+      <tr><td><code>index.html</code> at the root</td><td><code>index.html</code></td><td><code>http://&lt;server&gt;/</code> (port 80)</td></tr>
+      <tr><td>Valid port range</td><td><code>80</code>, or <code>1024</code> – <code>65535</code></td><td>anything else is ignored</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Cartridge file</h2>
+  <pre><code>{}</code></pre>
+  <p>One JSON object; an empty one is enough. The file itself is the marker: a
+    stick without <code>config.json</code> is ignored, and a file that is not a
+    JSON object is refused. Nothing inside it is read yet.</p>
+  <p>Reserved names at the root are never published: <code>config.json</code>,
+    <code>boot.png</code>, <code>README.txt</code>, <code>readme.txt</code>,
+    <code>System Volume Information</code>, <code>$RECYCLE.BIN</code>,
+    <code>.Trashes</code>. Everything else at the root is part of the port 80 site.</p>
+
+  <footer>
+    <span>served from RAM · release on disk</span>
+    <span>http://&lt;server&gt;:3000</span>
+  </footer>
+</main>
+</body>
+</html>

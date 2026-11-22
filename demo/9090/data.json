@@ -1,0 +1,6 @@
+{
+  "ok": true,
+  "ports": [3000, 8080, 9090],
+  "storage": "served from tmpfs (RAM)",
+  "backend": "none - these are plain files"
+}
