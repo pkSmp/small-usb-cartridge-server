@@ -185,6 +185,23 @@ fn parse_ports(text: &str) -> Vec<u16> {
         .collect()
 }
 
+/// One number for "the inputs of the split": the epoch, every member's
+/// (weight, key) and every member's capacity. Same number, same plan.
+fn plan_key(weights: &[(u32, u64)], capacity: &BTreeMap<u64, u64>, epoch: u64) -> u64 {
+    let mut h = hash::Sha256::new();
+    h.update(&epoch.to_be_bytes());
+    for (weight, key) in weights {
+        h.update(&weight.to_be_bytes());
+        h.update(&key.to_be_bytes());
+    }
+    for (key, room) in capacity {
+        h.update(&key.to_be_bytes());
+        h.update(&room.to_be_bytes());
+    }
+    let d = h.finish();
+    u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
+}
+
 fn membership_hash(ids: &[u128]) -> u64 {
     let mut sorted: Vec<u128> = ids.to_vec();
     sorted.sort_unstable();
@@ -204,6 +221,10 @@ pub struct Node {
     pub spec: Mutex<Spec>,
     pub store: Store,
     pub blueprint: Mutex<Option<Blueprint>>,
+    /// The last split, with the inputs it was computed from. Recomputing it is
+    /// pure CPU over every chunk, so it is only redone when a node joins or
+    /// leaves, a node's capacity changes, or the release changes.
+    pub plan_cache: Mutex<Option<(u64, BTreeMap<String, Vec<u64>>)>>,
     pub epoch: Mutex<u64>,
     pub pending: Mutex<Option<u64>>,
     pub ready: AtomicU64,
@@ -261,11 +282,21 @@ impl Node {
     }
 
     fn plan(&self) -> BTreeMap<String, Vec<u64>> {
-        let bp = self.blueprint.lock().unwrap().clone();
-        match bp {
-            Some(bp) => blueprint::assign(&bp, &self.weights(), REPLICAS, &self.capacity_mb()),
-            None => BTreeMap::new(),
+        let bp = match self.blueprint.lock().unwrap().clone() {
+            Some(bp) => bp,
+            None => return BTreeMap::new(),
+        };
+        let weights = self.weights();
+        let capacity = self.capacity_mb();
+        let stamp = plan_key(&weights, &capacity, bp.epoch);
+        if let Some((cached, plan)) = &*self.plan_cache.lock().unwrap() {
+            if *cached == stamp {
+                return plan.clone();
+            }
         }
+        let plan = blueprint::assign(&bp, &weights, REPLICAS, &capacity);
+        *self.plan_cache.lock().unwrap() = Some((stamp, plan.clone()));
+        plan
     }
 
     fn my_epoch(&self) -> u64 {
@@ -667,7 +698,7 @@ fn prepare_epoch(node: &Arc<Node>, epoch: u64) -> bool {
             }
             match got {
                 Some(bp) => {
-                    if let Err(e) = write_blueprint(&bp) {
+                    if let Err(e) = persist_blueprint(&node.store, &releases_root(), &bp) {
                         log("warn", &format!("cannot store blueprint: {}", e));
                         return false;
                     }
@@ -740,13 +771,28 @@ fn prepare_epoch(node: &Arc<Node>, epoch: u64) -> bool {
     true
 }
 
-fn write_blueprint(bp: &Blueprint) -> io::Result<()> {
+fn write_blueprint_at(releases: &Path, bp: &Blueprint) -> io::Result<()> {
     // Under `.cartridge`, because the release tree is also the site tree: a
     // loose `blueprint` file at the root would become a served URL, and
     // `publish` already skips that directory when it stages a release.
-    let dir = releases_root().join(bp.epoch.to_string()).join(".cartridge");
+    let dir = releases.join(bp.epoch.to_string()).join(".cartridge");
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("blueprint"), bp.text())
+}
+
+fn write_blueprint(bp: &Blueprint) -> io::Result<()> {
+    write_blueprint_at(&releases_root(), bp)
+}
+
+/// Keep the blueprint in both places it is read from: beside the chunks, where
+/// `run()` and `fleet archive` look after a restart, and inside the release,
+/// where a stick is cloned from. A node that only ever received its release
+/// from a peer used to write just the second one, so it could not archive or
+/// restart alone -- exactly the node that outlives the rest.
+fn persist_blueprint(store: &Store, releases: &Path, bp: &Blueprint) -> io::Result<()> {
+    fs::create_dir_all(store.root())?;
+    fs::write(store.root().join("blueprint"), bp.text())?;
+    write_blueprint_at(releases, bp)
 }
 
 /// Turn the release this box already serves into a fleet release: chunk it into
@@ -762,7 +808,8 @@ pub fn adopt() -> Result<i32, String> {
     let store = Store::at(store_root());
     let (bp, stats) = chunks::ingest(&live, &store, None, epoch)
         .map_err(|e| format!("{}: {}", live.display(), e))?;
-    write_blueprint(&bp).map_err(|e| format!("cannot write the blueprint: {}", e))?;
+    persist_blueprint(&store, &releases_root(), &bp)
+        .map_err(|e| format!("cannot write the blueprint: {}", e))?;
     println!(
         "epoch {}: {} files, {} chunks, {} ({} new, {} already held)",
         bp.epoch,
@@ -780,11 +827,15 @@ pub fn adopt() -> Result<i32, String> {
 /// Turn chunks back into the file tree. Single-chunk files are hard-linked, so
 /// a normal site costs no extra disk; multi-chunk files are concatenated once.
 fn materialize(bp: &Blueprint, store: &Store, epoch: u64) -> io::Result<()> {
-    let dir = releases_root().join(epoch.to_string());
+    materialize_at(bp, store, &releases_root().join(epoch.to_string()))
+}
+
+/// Turn chunks back into a file tree at an explicit directory.
+fn materialize_at(bp: &Blueprint, store: &Store, dir: &Path) -> io::Result<()> {
     for file in &bp.files {
         // The blueprint came off a stick or a peer. A path of `../../etc/x`
         // would otherwise be written outside the release.
-        let target = match crate::guard::safe_join(&dir, &file.path) {
+        let target = match crate::guard::safe_join(dir, &file.path) {
             Some(t) => t,
             None => {
                 return Err(io::Error::new(
@@ -811,6 +862,63 @@ fn materialize(bp: &Blueprint, store: &Store, epoch: u64) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Rebuild a node from one archive file: write its chunks into the store, put
+/// the blueprint back, and lay the tree out as a release. This is the path back
+/// from "every other machine is gone", and it needs no network at all.
+pub fn restore_into(path: &Path, store: &Store, releases: &Path) -> io::Result<(Blueprint, usize)> {
+    let (bp, chunks) = crate::archive::restore(path)?;
+    for (digest, bytes) in &chunks {
+        let (got, _) = store.put(bytes)?;
+        if got != *digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a chunk changed hash while it was being stored",
+            ));
+        }
+    }
+    fs::create_dir_all(store.root())?;
+    fs::write(store.root().join("blueprint"), bp.text())?;
+    materialize_at(&bp, store, &releases.join(bp.epoch.to_string()))?;
+    Ok((bp, chunks.len()))
+}
+
+/// `cartridge fleet restore FILE`: rebuild this box from an archive on disk.
+/// Deliberately offline: an operator restoring the last surviving copy should
+/// not have to have a working fleet first.
+pub fn restore_from(file: &str) -> Result<i32, String> {
+    let path = PathBuf::from(file);
+    let store = Store::at(store_root());
+    let (bp, chunks) = restore_into(&path, &store, &releases_root())
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
+    persist_blueprint(&store, &releases_root(), &bp)
+        .map_err(|e| format!("cannot write the blueprint: {}", e))?;
+    let target = releases_root().join(bp.epoch.to_string());
+    let live = live_path();
+    let tmp = releases_root().join(".live-restore");
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(&target, &tmp)
+        .map_err(|e| format!("cannot link {}: {}", live.display(), e))?;
+    if let Err(e) = fs::rename(&tmp, &live) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "cannot switch {} to epoch {}: {}",
+            live.display(),
+            bp.epoch,
+            e
+        ));
+    }
+    println!(
+        "restored epoch {} from {}: {} files, {} chunks, {}",
+        bp.epoch,
+        path.display(),
+        bp.files.len(),
+        chunks,
+        sys::human(bp.bytes())
+    );
+    println!("live: {} -> {}", live.display(), target.display());
+    Ok(0)
 }
 
 fn activate(node: &Arc<Node>, epoch: u64) {
@@ -1057,7 +1165,8 @@ pub fn import_release(node: &Arc<Node>, dir: &Path) -> Result<u64, String> {
     let base = dir.to_string_lossy().to_string();
     let (bp, stats) =
         chunks::ingest(dir, &node.store, None, epoch).map_err(|e| format!("{}: {}", base, e))?;
-    write_blueprint(&bp).map_err(|e| format!("cannot store blueprint: {}", e))?;
+    persist_blueprint(&node.store, &releases_root(), &bp)
+        .map_err(|e| format!("cannot store blueprint: {}", e))?;
     *node.blueprint.lock().unwrap() = Some(bp.clone());
     *node.pending.lock().unwrap() = Some(epoch);
     node.ready.store(0, Ordering::Relaxed);
@@ -1138,6 +1247,7 @@ pub fn run(
         spec: Mutex::new(spec),
         store,
         blueprint: Mutex::new(bp),
+        plan_cache: Mutex::new(None),
         epoch: Mutex::new(epoch),
         pending: Mutex::new(None),
         ready: AtomicU64::new(epoch),
@@ -1333,6 +1443,7 @@ mod tests {
             spec: Mutex::new(Spec { serve_bps: 200_000_000, disk_free_mb: 100_000, cores: 4, threads: 8, smt_gain: 1.0, ..Default::default() }),
             store: Store::at(root.join("store")),
             blueprint: Mutex::new(None),
+            plan_cache: Mutex::new(None),
             epoch: Mutex::new(0),
             pending: Mutex::new(None),
             ready: AtomicU64::new(0),
@@ -1465,6 +1576,85 @@ mod tests {
             }
         }
         assert_eq!(fs::read(target.join("3000/index.html")).unwrap(), b"<h1>hi</h1>");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_split_is_only_recomputed_when_its_inputs_change() {
+        let weights = [(100u32, 1u64), (200, 2)];
+        let mut cap = BTreeMap::new();
+        cap.insert(1u64, 10_000u64);
+        cap.insert(2, 10_000);
+        let base = plan_key(&weights, &cap, 3);
+        assert_eq!(base, plan_key(&weights, &cap, 3));
+        assert_ne!(base, plan_key(&weights, &cap, 4), "a new release must replan");
+        let joined = [(100u32, 1u64), (200, 2), (100, 3)];
+        assert_ne!(base, plan_key(&joined, &cap, 3), "a new node must replan");
+        let left = [(100u32, 1u64)];
+        assert_ne!(base, plan_key(&left, &cap, 3), "a lost node must replan");
+        let mut fuller = cap.clone();
+        fuller.insert(1, 9_000);
+        assert_ne!(base, plan_key(&weights, &fuller, 3), "a filling disk must replan");
+    }
+
+    #[test]
+    fn a_blueprint_from_a_peer_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "cartridge-fleet-persist-{}-{}",
+            std::process::id(),
+            ident::random_u128() & 0xffff
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("rel/3000")).unwrap();
+        fs::write(dir.join("rel/3000/index.html"), b"<h1>peer</h1>").unwrap();
+        let store = Store::at(dir.join("store"));
+        let (bp, _) = chunks::ingest(&dir.join("rel"), &store, None, 4).unwrap();
+        // Stand in for a node that fetched the release over the wire: only the
+        // store copy matters after this, because that is what `run()` reads.
+        fs::remove_file(store.root().join("blueprint")).unwrap();
+        let releases = dir.join("releases");
+        persist_blueprint(&store, &releases, &bp).unwrap();
+        let text = fs::read_to_string(store.root().join("blueprint")).unwrap();
+        assert_eq!(Blueprint::parse(&text).unwrap(), bp);
+        assert!(releases.join("4/.cartridge/blueprint").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_archive_rebuilds_a_node_with_no_peers() {
+        let dir = std::env::temp_dir().join(format!(
+            "cartridge-fleet-restore-{}-{}",
+            std::process::id(),
+            ident::random_u128() & 0xffff
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("rel/3000")).unwrap();
+        let page = b"<h1>rebuild me</h1>".repeat(300);
+        fs::write(dir.join("rel/3000/index.html"), &page).unwrap();
+        // Larger than one chunk, so restore has to reassemble a file too.
+        fs::write(dir.join("rel/3000/app.js"), vec![9u8; 5 * 1024 * 1024]).unwrap();
+        let store = Store::at(dir.join("store"));
+        let (bp, _) = chunks::ingest(&dir.join("rel"), &store, None, 5).unwrap();
+        let big = bp.files.iter().find(|f| f.path == "3000/app.js").unwrap();
+        assert!(big.pieces.len() > 1, "the big file must span chunks");
+        let path = dir.join("5.cart");
+        crate::archive::build(&bp, &store, &path).unwrap();
+
+        // A brand-new box: an empty store and an empty release tree.
+        let fresh = Store::at(dir.join("fresh-store"));
+        let releases = dir.join("fresh-releases");
+        let (back, chunks) = restore_into(&path, &fresh, &releases).unwrap();
+        assert_eq!(back, bp);
+        assert_eq!(chunks, bp.chunks.len());
+        let tree = releases.join("5");
+        assert_eq!(fs::read(tree.join("3000/index.html")).unwrap(), page);
+        assert_eq!(fs::read(tree.join("3000/app.js")).unwrap().len(), 5 * 1024 * 1024);
+        assert!(fs::read_to_string(fresh.root().join("blueprint"))
+            .unwrap()
+            .starts_with("CARTBLUE 1"));
+        for piece in &bp.chunks {
+            assert!(fresh.has(&piece.hash), "{} missing after restore", piece.hash);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

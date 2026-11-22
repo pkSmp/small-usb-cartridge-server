@@ -50,6 +50,7 @@ fn usage() -> ! {
          \x20 cluster [--root DIR] [--name ID] [--offset N]   share sites and load with the boxes on the switch\n\
          \x20 fleet [--name ID] [--beacon PORT] [--dns PORT]   share storage and updates with the boxes on the switch\n\
          \x20 fleet status | store | key | archive | adopt   inspect or manage the fleet\n\
+         \x20 fleet restore FILE               rebuild this box from one archive\n\
          \x20 publish                        copy the live release into RAM\n\
          \x20 import DEVICE                  ingest a cartridge\n\
          \x20 status [--watch]               report what the machine sees\n\
@@ -260,6 +261,10 @@ fn run_fleet(args: &[String]) -> Result<i32, String> {
         Some("store") => return fleet::sites_on_disk(),
         Some("archive") => return fleet::archive_now(),
         Some("adopt") => return fleet::adopt(),
+        Some("restore") => {
+            let file = args.get(1).ok_or("fleet restore needs an archive path")?;
+            return fleet::restore_from(file);
+        }
         Some("key") => {
             let created = auth::ensure_key()?;
             if created {
