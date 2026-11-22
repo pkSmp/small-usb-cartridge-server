@@ -163,6 +163,7 @@ fn reason(code: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         414 => "URI Too Long",
+        416 => "Range Not Satisfiable",
         500 => "Internal Server Error",
         _ => "Error",
     }
@@ -539,36 +540,55 @@ impl Conn {
     }
 }
 
+/// What is wrong with a decoded request path, if anything. Checked after
+/// decoding, because `%2e%2e` is `..` to the filesystem.
+///
+/// Control bytes have no place in a path and a decoded `%0d%0a` would end up in
+/// the `Location` header of a directory redirect: response splitting. A
+/// dot-prefixed component is `.git`, `.env` or `..` and is never a site file.
+fn path_error(decoded: &str) -> Option<u16> {
+    if !decoded.starts_with('/') || decoded.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Some(400);
+    }
+    if decoded.split('/').any(|s| !s.is_empty() && s.starts_with('.')) {
+        return Some(403);
+    }
+    None
+}
+
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
-    let spec = value.strip_prefix("bytes=")?;
+/// A `Range` header. `Err` means the client asked for something this file
+/// cannot satisfy, which is a 416 and not a silent 200: sending the whole file
+/// to a player that asked for the middle of it is how a seek looks broken.
+fn parse_range(value: &str, size: u64) -> Result<(u64, u64), ()> {
+    let spec = value.strip_prefix("bytes=").ok_or(())?;
     if spec.contains(',') {
-        return None;
+        return Err(());
     }
-    let (a, b) = spec.split_once('-')?;
+    let (a, b) = spec.split_once('-').ok_or(())?;
     if a.is_empty() {
-        let tail: u64 = b.trim().parse().ok()?;
+        let tail: u64 = b.trim().parse().map_err(|_| ())?;
         if tail == 0 || size == 0 {
-            return None;
+            return Err(());
         }
-        return Some((size.saturating_sub(tail), size - 1));
+        return Ok((size.saturating_sub(tail), size - 1));
     }
-    let start: u64 = a.trim().parse().ok()?;
+    let start: u64 = a.trim().parse().map_err(|_| ())?;
     if start >= size {
-        return None;
+        return Err(());
     }
     let end = if b.trim().is_empty() {
         size - 1
     } else {
-        b.trim().parse::<u64>().ok()?.min(size - 1)
+        b.trim().parse::<u64>().map_err(|_| ())?.min(size - 1)
     };
     if end < start {
-        return None;
+        return Err(());
     }
-    Some((start, end))
+    Ok((start, end))
 }
 
 struct Req {
@@ -577,6 +597,8 @@ struct Req {
     if_none_match: bool,
     if_modified: Option<i64>,
     range: Option<(usize, usize)>,
+    /// A Range header this file cannot satisfy: answer 416.
+    range_bad: bool,
     accept_gzip: bool,
 }
 
@@ -599,8 +621,12 @@ fn deliver(c: &mut Cached, conn: &mut Conn, req: &Req, clock: &mut Clock) -> boo
             conn.simple(304, req.keep, clock);
             return req.keep;
         }
+        if req.range_bad {
+            conn.simple(416, req.keep, clock);
+            return req.keep;
+        }
         if let Some(range) = req.range {
-            return partial(c, conn, range, req.head_only, clock);
+            return partial(c, conn, range, req.head_only, req.keep, clock);
         }
         if req.accept_gzip {
             if let Some(gz) = c.gz.as_mut() {
@@ -644,6 +670,7 @@ fn partial(
     conn: &mut Conn,
     (start, end): (usize, usize),
     head_only: bool,
+    keep: bool,
     clock: &mut Clock,
 ) -> bool {
     let len = end - start + 1;
@@ -664,8 +691,15 @@ fn partial(
     head.extend_from_slice(len.to_string().as_bytes());
     head.extend_from_slice(b"\r\nETag: ");
     head.extend_from_slice(c.etag.as_bytes());
-    head.extend_from_slice(b"\r\nConnection: keep-alive\r\n\r\n");
+    head.extend_from_slice(if keep {
+        &b"\r\nConnection: keep-alive\r\n\r\n"[..]
+    } else {
+        &b"\r\nConnection: close\r\n\r\n"[..]
+    });
     conn.queue(head, None, start as i64, 0);
+    if !keep {
+        conn.closing = true;
+    }
     if !head_only {
         if c.in_ram {
             conn.outbuf.extend_from_slice(&c.buf[c.head_len + start..c.head_len + end + 1]);
@@ -675,7 +709,7 @@ fn partial(
             conn.file_left = len as u64;
         }
     }
-    true
+    keep
 }
 
 fn add_epoll(epfd: c_int, fd: RawFd, events: u32, token: u64) {
@@ -922,6 +956,11 @@ fn handle_request(
     let mut if_modified_raw: Option<&str> = None;
     let mut range_raw: Option<&str> = None;
     let mut accept_gzip = false;
+    // This server never accepts a request body. A message that carries one
+    // would leave its bytes in the buffer, where they would be read as the next
+    // request -- the request-smuggling shape -- so the framing headers are
+    // refused outright instead of ignored.
+    let mut bad_framing = false;
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("if-none-match:") {
@@ -933,7 +972,17 @@ fn handle_request(
             range_raw = line.split_once(':').map(|(_, v)| v.trim());
         } else if lower.starts_with("accept-encoding:") {
             accept_gzip = lower.contains("gzip");
+        } else if lower.starts_with("transfer-encoding:") {
+            bad_framing = true;
+        } else if lower.starts_with("content-length:") {
+            if line.split_once(':').map(|(_, v)| v.trim()) != Some("0") {
+                bad_framing = true;
+            }
         }
+    }
+    if bad_framing {
+        conn.simple(400, false, clock);
+        return false;
     }
 
     let decoded = match decode_path(target) {
@@ -943,15 +992,9 @@ fn handle_request(
             return false;
         }
     };
-    if !decoded.starts_with('/') {
-        conn.simple(400, false, clock);
+    if let Some(code) = path_error(&decoded) {
+        conn.simple(code, false, clock);
         return false;
-    }
-    for segment in decoded.split('/') {
-        if (!segment.is_empty() && segment.starts_with('.')) || segment.contains('\0') {
-            conn.simple(403, false, clock);
-            return false;
-        }
     }
 
     // Hot path: the same path inside the last second, already a finished
@@ -970,7 +1013,7 @@ fn handle_request(
         Locate::File(path) => {
             let (mtime, size) = match file_stats(&path) {
                 Some(s) => s,
-                None => return deliver_error(conn, cache, decoded, 404, clock),
+                None => return deliver_error(conn, cache, decoded, 404, keep, head_only, clock),
             };
             match cache.get_mut(decoded.as_str()) {
                 Some(c) if c.status == 200 && c.mtime == mtime && c.size == size => {
@@ -1023,15 +1066,24 @@ fn deliver_error(
     cache: &mut HashMap<String, Cached>,
     decoded: String,
     code: u16,
+    keep: bool,
+    head_only: bool,
     clock: &mut Clock,
 ) -> bool {
-    let keep = true;
     if cache.len() >= CACHE_ENTRIES {
         cache.clear();
     }
     cache.insert(decoded.clone(), Cached::error(code));
     let c = cache.get_mut(decoded.as_str()).unwrap();
-    let req = Req { head_only: false, keep, if_none_match: false, if_modified: None, range: None, accept_gzip: false };
+    let req = Req {
+        head_only,
+        keep,
+        if_none_match: false,
+        if_modified: None,
+        range: None,
+        range_bad: false,
+        accept_gzip: false,
+    };
     deliver(c, conn, &req, clock)
 }
 
@@ -1061,8 +1113,12 @@ fn build_req(
         Some(t) => Some(t),
         None => None,
     };
-    let range = range.and_then(|r| parse_range(r, c.size)).map(|(s, e)| (s as usize, e as usize));
-    Req { head_only, keep, if_none_match, if_modified, range, accept_gzip }
+    let (range, range_bad) = match range.map(|r| parse_range(r, c.size)) {
+        Some(Ok((s, e))) => (Some((s as usize, e as usize)), false),
+        Some(Err(())) => (None, true),
+        None => (None, false),
+    };
+    Req { head_only, keep, if_none_match, if_modified, range, range_bad, accept_gzip }
 }
 
 fn date_matches(c: &Cached, if_modified: Option<i64>) -> bool {
@@ -1408,14 +1464,59 @@ pub fn run(
     Ok(())
 }
 
+/// Give up root after the ports are bound. The check matters: a `setuid` that
+/// fails would leave a network-facing server running as root, and the failure
+/// is a return value, not a signal.
 pub fn drop_privileges() {
     unsafe {
         if geteuid() == 0 {
             setgid(65534);
             setuid(65534);
+            if geteuid() == 0 {
+                eprintln!("cartridge web: could not drop root privileges; refusing to serve");
+                _exit(1);
+            }
         }
     }
 }
 
 #[allow(dead_code)]
 fn unused(_: c_long) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_that_could_split_a_response_is_refused() {
+        assert_eq!(path_error("/a\r\nSet-Cookie: x"), Some(400));
+        assert_eq!(path_error("/a\0b"), Some(400));
+        assert_eq!(path_error("a/b"), Some(400));
+        assert_eq!(path_error("/a/../b"), Some(403));
+        assert_eq!(path_error("/.git/config"), Some(403));
+        assert_eq!(path_error("/a/b.html"), None);
+        assert_eq!(path_error("/"), None);
+    }
+
+    #[test]
+    fn a_path_is_decoded_once_and_checked_after() {
+        // `%2e%2e` is `..` to the filesystem, so the check has to run on the
+        // decoded form; a truncated escape is a bad request, not a filename.
+        assert_eq!(decode_path("/%2e%2e/b").as_deref(), Some("/../b"));
+        assert_eq!(path_error("/../b"), Some(403));
+        assert_eq!(decode_path("/a%2"), None);
+        assert_eq!(decode_path("/a?x=1").as_deref(), Some("/a"));
+    }
+
+    #[test]
+    fn an_unsatisfiable_range_is_a_416_not_the_whole_file() {
+        assert_eq!(parse_range("bytes=0-9", 100), Ok((0, 9)));
+        assert_eq!(parse_range("bytes=90-", 100), Ok((90, 99)));
+        assert_eq!(parse_range("bytes=-10", 100), Ok((90, 99)));
+        assert_eq!(parse_range("bytes=100-", 100), Err(()));
+        assert_eq!(parse_range("bytes=5-1", 100), Err(()));
+        assert_eq!(parse_range("bytes=-0", 100), Err(()));
+        assert_eq!(parse_range("items=0-1", 100), Err(()));
+        assert_eq!(parse_range("bytes=0-1,3-4", 100), Err(()));
+    }
+}

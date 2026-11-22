@@ -204,13 +204,14 @@ fn inflate_block(
     limit: usize,
 ) -> Result<(), String> {
     loop {
-        // One symbol emits at most 258 bytes, so checking per symbol never
-        // overshoots the limit by more than one match.
-        if out.len() >= limit {
-            return Err("inflate: output exceeds the limit".into());
-        }
+        // The limit is checked against what a symbol is about to emit, not
+        // against the output so far: a stream that ends exactly on the cap is
+        // valid, and rejecting it made every exact-size decompression fail.
         let sym = lit.decode(br)? as usize;
         if sym < 256 {
+            if out.len() >= limit {
+                return Err("inflate: output exceeds the limit".into());
+            }
             out.push(sym as u8);
         } else if sym == 256 {
             return Ok(());
@@ -220,6 +221,9 @@ fn inflate_block(
                 return Err("deflate: bad length symbol".into());
             }
             let len = LEN_BASE[idx] as usize + br.bits(LEN_EXTRA[idx])? as usize;
+            if out.len() + len > limit {
+                return Err("inflate: output exceeds the limit".into());
+            }
             let dsym = dist.decode(br)? as usize;
             if dsym >= DIST_BASE.len() {
                 return Err("deflate: bad distance symbol".into());

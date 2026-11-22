@@ -180,6 +180,11 @@ struct ReleaseInfo {
 
 struct Shared {
     node: String,
+    /// The fleet key, when one is provisioned. A peer that cannot sign its
+    /// manifest is not trusted with this box's site content, and a beacon that
+    /// is not signed is ignored: without this, anything on the switch could
+    /// announce a newer release and every box would adopt its bytes.
+    secret: Option<Vec<u8>>,
     workers: u32,
     capacity: u32,
     control: u16,
@@ -345,8 +350,8 @@ fn beacon_text(shared: &Shared) -> String {
         .map(|p| p.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    format!(
-        "CART1 {} {} {} {} {} {} {} {}\n",
+    let body = format!(
+        "CART1 {} {} {} {} {} {} {} {}",
         shared.node,
         if info.name.is_empty() { "-" } else { &info.name },
         if info.fp.is_empty() { "-" } else { &info.fp },
@@ -355,13 +360,29 @@ fn beacon_text(shared: &Shared) -> String {
         shared.control,
         ports_text,
         shared.capacity
-    )
+    );
+    match &shared.secret {
+        Some(key) => format!("{} {}\n", body, crate::auth::tag(key, body.as_bytes())),
+        None => format!("{}\n", body),
+    }
 }
 
-fn parse_beacon(text: &str, from: Ipv4Addr) -> Option<Peer> {
-    let fields: Vec<&str> = text.trim().split(' ').collect();
+fn parse_beacon(text: &str, from: Ipv4Addr, secret: Option<&Vec<u8>>) -> Option<Peer> {
+    let text = text.trim();
+    let fields: Vec<&str> = text.split(' ').collect();
     if fields.len() < 8 || fields[0] != "CART1" {
         return None;
+    }
+    // With a fleet key, an unsigned beacon is somebody else on the switch and
+    // must not be able to place work, advertise a release or shift the map.
+    if let Some(key) = secret {
+        if fields.len() != 10 {
+            return None;
+        }
+        let body = fields[..9].join(" ");
+        if !crate::auth::verify(key, body.as_bytes(), fields[9]) {
+            return None;
+        }
     }
     let ports: Vec<u16> = fields[7]
         .split(',')
@@ -444,7 +465,7 @@ fn beacon_recv(shared: Arc<Shared>, port: u16) {
             Ok((n, SocketAddr::V4(from))) => {
                 if let Some(peer) = std::str::from_utf8(&buf[..n])
                     .ok()
-                    .and_then(|t| parse_beacon(t, *from.ip()))
+                    .and_then(|t| parse_beacon(t, *from.ip(), shared.secret.as_ref()))
                 {
                     if peer.id != shared.node {
                         if !known.contains(&peer.id) {
@@ -476,6 +497,16 @@ fn beacon_recv(shared: Arc<Shared>, port: u16) {
 
 // --------------------------------------------------------------------- sync
 
+/// The exact bytes of a manifest response. The signature is taken over this
+/// one string on both ends, so the sender and the puller cannot drift apart.
+fn manifest_body(fp: &str, entries: &[Entry]) -> String {
+    let mut text = format!("OK {} {}\n", fp, entries.len());
+    for e in entries {
+        text.push_str(&format!("{}\t{}\t{}\n", e.size, e.hash, e.rel));
+    }
+    text
+}
+
 fn sync_log(tag: &str, message: &str) {
     log(tag, &format!("cluster: {}", message));
 }
@@ -489,13 +520,28 @@ struct SyncReport {
     fingerprint: String,
 }
 
+/// A release folder is a timestamp this box made or synced: digits, dashes and
+/// dots, never a path. A peer that names `/etc` or `../..` is a bug or an
+/// attack, and joining it onto the releases root would delete or serve
+/// something outside it.
+fn release_name(name: &str) -> Option<&str> {
+    if name.is_empty() || name.len() > 64 || name.starts_with('.') || name.contains("..") {
+        return None;
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_digit() || b == b'-' || b == b'.')
+    {
+        return None;
+    }
+    Some(name)
+}
+
 fn release_dir(name: &str) -> Option<PathBuf> {
     if name.is_empty() || name == "-" {
         return live_dir().map(|(_, d)| d);
     }
-    if name.contains('/') || name.contains("..") {
-        return None;
-    }
+    let name = release_name(name)?;
     let path = Path::new(RELEASES).join(name);
     if path.is_dir() {
         Some(path)
@@ -516,10 +562,47 @@ fn safe_join(dir: &Path, rel: &str) -> Option<PathBuf> {
     Some(dir.join(rel))
 }
 
+/// One protocol line, with a hard cap. `BufRead::read_line` grows until it sees
+/// a newline, so a peer that never sends one could ask this box for all its
+/// memory; the cap is checked before anything is kept.
+fn read_line_capped<R: BufRead>(reader: &mut R, cap: usize) -> Result<String, String> {
+    let mut out: Vec<u8> = Vec::with_capacity(64);
+    loop {
+        let buf = reader.fill_buf().map_err(|e| e.to_string())?;
+        if buf.is_empty() {
+            if out.is_empty() {
+                return Err("the peer closed the connection".into());
+            }
+            break;
+        }
+        if let Some(i) = buf.iter().position(|b| *b == b'\n') {
+            if out.len() + i > cap {
+                return Err(format!("a peer line exceeds {} bytes", cap));
+            }
+            out.extend_from_slice(&buf[..i]);
+            reader.consume(i + 1);
+            break;
+        }
+        if out.len() + buf.len() > cap {
+            return Err(format!("a peer line exceeds {} bytes", cap));
+        }
+        let n = buf.len();
+        out.extend_from_slice(buf);
+        reader.consume(n);
+    }
+    while out.last() == Some(&b'\r') {
+        out.pop();
+    }
+    Ok(String::from_utf8_lossy(&out).to_string())
+}
+
 /// Pull the peer's release: manifest first, then only the files this box does
 /// not already hold. Identical files are hard-linked from the live release, so
 /// a second sync of the same cartridge writes nothing.
 fn pull(peer: &Peer, want: &str, mine_fp: &str) -> Result<SyncReport, String> {
+    let want = release_name(want)
+        .ok_or_else(|| format!("refusing release name {:?}", want))?
+        .to_string();
     let addr = SocketAddrV4::new(peer.ip, peer.control);
     let stream = TcpStream::connect_timeout(&SocketAddr::V4(addr), Duration::from_secs(5))
         .map_err(|e| format!("cannot reach {}:{} ({})", peer.ip, peer.control, e))?;
@@ -534,40 +617,85 @@ fn pull(peer: &Peer, want: &str, mine_fp: &str) -> Result<SyncReport, String> {
 
     out.write_all(format!("MANIFEST {}\n", want).as_bytes())
         .map_err(|e| e.to_string())?;
-    let mut head = String::new();
-    reader.read_line(&mut head).map_err(|e| e.to_string())?;
-    let head = head.trim_end().to_string();
+    let head = read_line_capped(&mut reader, 4096)?;
     let rest = head
         .strip_prefix("OK ")
         .ok_or_else(|| format!("peer refused the manifest: {}", head))?;
     let mut parts = rest.splitn(2, ' ');
     let fingerprint = parts.next().unwrap_or("").to_string();
     let count: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    let mut entries: Vec<Entry> = Vec::with_capacity(count);
+    // Every number below comes off the wire. A manifest is a list of promises
+    // and a hostile peer can promise a million files or a terabyte each, so the
+    // same limits the importer applies are applied here, before allocating.
+    if count > crate::guard::MAX_FILES {
+        return Err(format!(
+            "the peer offered {} files, over the {} limit",
+            count,
+            crate::guard::MAX_FILES
+        ));
+    }
+    let mut signed = format!("{}\n", head);
+    let mut entries: Vec<Entry> = Vec::with_capacity(count.min(4096));
+    let mut total = 0u64;
+    let mut tag: Option<String> = None;
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-            return Err("the peer closed the manifest early".into());
-        }
-        let line = line.trim_end().to_string();
+        let line = read_line_capped(&mut reader, 8192)?;
         if line == "END" {
             break;
+        }
+        if let Some(t) = line.strip_prefix("AUTH ") {
+            tag = Some(t.trim().to_string());
+            continue;
         }
         let mut f = line.splitn(3, '\t');
         let size: u64 = f.next().unwrap_or("0").parse().unwrap_or(0);
         let hash = f.next().unwrap_or("").to_string();
         let rel = f.next().unwrap_or("").to_string();
-        if rel.is_empty() || hash.len() != 64 {
+        if rel.is_empty() || !crate::chunks::valid_hash(&hash) {
             return Err("the peer sent a malformed manifest line".into());
         }
+        if entries.len() >= crate::guard::MAX_FILES {
+            return Err(format!("the peer sent more than {} files", crate::guard::MAX_FILES));
+        }
+        if size > crate::guard::MAX_FILE_BYTES {
+            return Err(format!(
+                "the peer offered a {} file",
+                sys::human(size)
+            ));
+        }
+        total = total.saturating_add(size);
+        if total > crate::guard::MAX_TOTAL_BYTES {
+            return Err(format!(
+                "the peer offered {} in total",
+                sys::human(total)
+            ));
+        }
+        signed.push_str(&line);
+        signed.push('\n');
         entries.push(Entry { rel, size, hash });
+    }
+    if entries.len() != count {
+        return Err(format!(
+            "the peer announced {} files but sent {}",
+            count,
+            entries.len()
+        ));
+    }
+    // The manifest names the content this box is about to adopt. Signed, only a
+    // holder of the fleet key can do that; unsigned, the newest epoch on the
+    // switch is whatever any machine says it is.
+    if let Some(key) = crate::auth::fleet_key() {
+        let tag = tag.ok_or_else(|| "the peer did not sign its manifest".to_string())?;
+        if !crate::auth::verify(&key, signed.as_bytes(), &tag) {
+            return Err("the peer's manifest signature is wrong".into());
+        }
     }
     if fingerprint == mine_fp {
         let _ = out.write_all(b"BYE\n");
         return Ok(SyncReport { files: entries.len(), fingerprint, ..Default::default() });
     }
 
-    let target = Path::new(RELEASES).join(want);
+    let target = Path::new(RELEASES).join(&want);
     if target.exists() {
         if live_dir().map(|(n, _)| n == want).unwrap_or(false) {
             return Err(format!("{} is already live here with different content", want));
@@ -605,13 +733,20 @@ fn pull(peer: &Peer, want: &str, mine_fp: &str) -> Result<SyncReport, String> {
         }
         out.write_all(format!("GET {} {}\n", want, entry.rel).as_bytes())
             .map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let line = read_line_capped(&mut reader, 4096)?;
         let n: usize = line
-            .trim_end()
             .strip_prefix("SIZE ")
             .and_then(|v| v.parse().ok())
-            .ok_or_else(|| format!("peer refused {}: {}", entry.rel, line.trim_end()))?;
+            .ok_or_else(|| format!("peer refused {}: {}", entry.rel, line))?;
+        // The manifest promised this file's length; a peer that announces a
+        // different one is either broken or trying to make this box allocate.
+        if n as u64 != entry.size {
+            let _ = fs::remove_dir_all(&target);
+            return Err(format!(
+                "{} is {} bytes on the peer, {} in its manifest",
+                entry.rel, n, entry.size
+            ));
+        }
         let mut body = vec![0u8; n];
         let mut got = 0;
         while got < n {
@@ -663,6 +798,7 @@ fn prune(keep: &str) {
 /// Point `live` at the synced release and stage it into RAM, exactly as a
 /// cartridge import does.
 fn activate(name: &str) -> Result<(), String> {
+    let name = release_name(name).ok_or_else(|| format!("refusing release name {:?}", name))?;
     let release = format!("{}/{}", RELEASES, name);
     if !Path::new(&release).is_dir() {
         return Err(format!("{} is missing", release));
@@ -750,11 +886,10 @@ fn serve_peer(stream: TcpStream, shared: &Shared) -> io::Result<()> {
     let mut out = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(());
-        }
-        let line = line.trim_end().to_string();
+        let line = match read_line_capped(&mut reader, 8192) {
+            Ok(l) => l,
+            Err(_) => return Ok(()),
+        };
         let mut it = line.splitn(3, ' ');
         match it.next().unwrap_or("") {
             "INFO" => {
@@ -778,9 +913,13 @@ fn serve_peer(stream: TcpStream, shared: &Shared) -> io::Result<()> {
                     }
                 };
                 let entries = manifest(&dir);
-                write!(out, "OK {} {}\n", fingerprint(&entries), entries.len())?;
-                for e in &entries {
-                    write!(out, "{}\t{}\t{}\n", e.size, e.hash, e.rel)?;
+                let fp = fingerprint(&entries);
+                let signed = manifest_body(&fp, &entries);
+                out.write_all(signed.as_bytes())?;
+                // The manifest is what names the content, so it is the part that
+                // has to be signed; every file is verified by hash anyway.
+                if let Some(key) = &shared.secret {
+                    write!(out, "AUTH {}\n", crate::auth::tag(key, signed.as_bytes()))?;
                 }
                 write!(out, "END\n")?;
             }
@@ -820,12 +959,22 @@ fn control_server(shared: Arc<Shared>, port: u16) {
             return;
         }
     };
+    // One thread per peer connection, but not one thread per packet: without a
+    // cap a flood of connects is a memory exhaustion, one 8 MiB stack at a time.
+    let live = Arc::new(AtomicU32::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
+                if live.load(Ordering::Relaxed) >= 64 {
+                    drop(s);
+                    continue;
+                }
+                live.fetch_add(1, Ordering::Relaxed);
                 let shared = shared.clone();
+                let live = live.clone();
                 std::thread::spawn(move || {
                     let _ = serve_peer(s, &shared);
+                    live.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(_) => sys::sleep_ms(50),
@@ -1768,6 +1917,87 @@ fn balancer(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_release_name_cannot_be_a_path() {
+        assert_eq!(release_name("20261122-102923"), Some("20261122-102923"));
+        assert_eq!(release_name("1"), Some("1"));
+        for bad in [
+            "",
+            "/etc",
+            "../..",
+            "a/b",
+            ".hidden",
+            "..",
+            "x y",
+            "2026..",
+            "-x",
+            "releases/../../etc",
+        ] {
+            assert_eq!(release_name(bad), None, "{:?} must be refused", bad);
+        }
+    }
+
+    #[test]
+    fn a_peer_line_is_bounded() {
+        let mut input = std::io::Cursor::new(b"OK 1 2\n".to_vec());
+        assert_eq!(read_line_capped(&mut input, 64).unwrap(), "OK 1 2");
+        let mut crlf = std::io::Cursor::new(b"END\r\n".to_vec());
+        assert_eq!(read_line_capped(&mut crlf, 64).unwrap(), "END");
+        let mut long = std::io::Cursor::new(vec![b'x'; 4096]);
+        assert!(
+            read_line_capped(&mut long, 64).is_err(),
+            "a line with no newline must not grow the buffer"
+        );
+        let mut huge = std::io::Cursor::new(format!("{}x\n", "y".repeat(9000)).into_bytes());
+        assert!(read_line_capped(&mut huge, 8192).is_err());
+    }
+
+    #[test]
+    fn the_signed_manifest_is_the_text_the_puller_checks() {
+        // The sender signs `manifest_body`; the puller rebuilds the same bytes
+        // from the lines it read. If those ever disagree, every signed sync
+        // would fail, so the two forms are compared here.
+        let entries = vec![
+            Entry { rel: "index.html".into(), size: 12, hash: "ab".repeat(32) },
+            Entry { rel: "8080/a.txt".into(), size: 3, hash: "cd".repeat(32) },
+        ];
+        let fp = fingerprint(&entries);
+        let body = manifest_body(&fp, &entries);
+        let key = b"fleet".to_vec();
+        let tag = crate::auth::tag(&key, body.as_bytes());
+
+        let mut seen = format!("OK {} {}\n", fp, entries.len());
+        for e in &entries {
+            seen.push_str(&format!("{}\t{}\t{}\n", e.size, e.hash, e.rel));
+        }
+        assert_eq!(seen, body, "the puller must rebuild exactly these bytes");
+        assert!(crate::auth::verify(&key, seen.as_bytes(), &tag));
+        assert!(!crate::auth::verify(b"other", seen.as_bytes(), &tag));
+    }
+
+    #[test]
+    fn a_beacon_must_be_signed_once_a_key_exists() {
+        let key = b"fleet".to_vec();
+        let body = "CART1 node1 20261122-102923 abc 4 0 29701 8080 400";
+        let signed = format!("{} {}", body, crate::auth::tag(&key, body.as_bytes()));
+        let from = Ipv4Addr::new(10, 0, 0, 2);
+        assert!(parse_beacon(&signed, from, Some(&key)).is_some());
+        assert!(
+            parse_beacon(body, from, Some(&key)).is_none(),
+            "an unsigned beacon must not be believed"
+        );
+        let forged = format!("{} {}", body, "0".repeat(64));
+        assert!(parse_beacon(&forged, from, Some(&key)).is_none());
+        // With no key provisioned the fleet stays open, as documented.
+        assert!(parse_beacon(body, from, None).is_some());
+        assert!(parse_beacon(&signed, from, None).is_some());
+    }
+}
+
 // ---------------------------------------------------------------------- run
 
 pub fn run(
@@ -1826,6 +2056,7 @@ pub fn run(
         served: AtomicU64::new(0),
         peers: Mutex::new(Arc::new(Vec::new())),
         release: Mutex::new(ReleaseInfo::default()),
+        secret: crate::auth::fleet_key(),
         key: placement::node_key(&node),
         tfa: Mutex::new(HashMap::new()),
     });

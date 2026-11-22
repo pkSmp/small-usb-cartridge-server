@@ -222,7 +222,9 @@ pub fn build_with_map(
     out.extend_from_slice(format!("epoch {}\nroot {}\n", bp.epoch, bp.root).as_bytes());
     out.extend_from_slice(format!("index {} {}\n", index_gz.len(), index.len()).as_bytes());
     out.extend_from_slice(format!("netmap {} {}\n", map_gz.len(), map.len()).as_bytes());
-    out.extend_from_slice(format!("data {}\n", packed.len()).as_bytes());
+    // The raw length lets a restore cap the decompression at exactly what the
+    // archive claims: a corrupt or hostile file cannot inflate past it.
+    out.extend_from_slice(format!("data {} {}\n", packed.len(), raw.len()).as_bytes());
     out.extend_from_slice(&index_gz);
     out.extend_from_slice(&map_gz);
     out.extend_from_slice(&packed);
@@ -278,6 +280,8 @@ pub fn restore_full(path: &Path) -> io::Result<(Blueprint, Vec<(String, Vec<u8>)
     let mut map_gz: Option<(usize, usize)> = None;
     let mut map_text_len: usize = 0;
     let data_len: usize;
+    /// Present in `CARTARC 3` and later; older archives leave it out.
+    let mut data_raw: Option<usize> = None;
     loop {
         let line = read_line(&buf, &mut pos).ok_or_else(|| bad("missing data size"))?;
         let text = std::str::from_utf8(line).map_err(|_| bad("header is not text"))?;
@@ -317,6 +321,7 @@ pub fn restore_full(path: &Path) -> io::Result<(Blueprint, Vec<(String, Vec<u8>)
                     .next()
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| bad("bad data size"))?;
+                data_raw = fields.next().and_then(|v| v.parse().ok());
                 break;
             }
             _ => return Err(bad("unknown header line")),
@@ -333,10 +338,17 @@ pub fn restore_full(path: &Path) -> io::Result<(Blueprint, Vec<(String, Vec<u8>)
 
     // The map first: it is independent of the data.
     let map_start = pos + index_bytes;
+    const MAX_INDEX: usize = 64 * 1024 * 1024;
     let map = match map_gz {
         Some((packed, raw_len)) => {
-            let bytes = gzip::inflate_bytes(&buf[map_start..map_start + packed])
-                .map_err(|e| bad(&format!("cannot decompress the network map: {}", e)))?;
+            if raw_len > 8 * 1024 * 1024 {
+                return Err(bad("the network map is larger than a map can be"));
+            }
+            let bytes = crate::inflate::gzip_decompress_limited(
+                &buf[map_start..map_start + packed],
+                raw_len,
+            )
+            .map_err(|e| bad(&format!("cannot decompress the network map: {}", e)))?;
             if bytes.len() != raw_len {
                 return Err(bad("network map length disagrees with its header"));
             }
@@ -349,8 +361,25 @@ pub fn restore_full(path: &Path) -> io::Result<(Blueprint, Vec<(String, Vec<u8>)
     };
 
     let data_start = map_start + map_bytes;
-    let plain = gzip::inflate_bytes(&buf[data_start..data_start + data_len])
-        .map_err(|e| bad(&format!("cannot decompress: {}", e)))?;
+    let plain = match data_raw {
+        Some(raw_len) => {
+            if raw_len as u64 > crate::guard::MAX_TOTAL_BYTES {
+                return Err(bad("the archive declares more data than a release may hold"));
+            }
+            let bytes = crate::inflate::gzip_decompress_limited(
+                &buf[data_start..data_start + data_len],
+                raw_len,
+            )
+            .map_err(|e| bad(&format!("cannot decompress: {}", e)))?;
+            if bytes.len() != raw_len {
+                return Err(bad("archive data is not the length its header declares"));
+            }
+            bytes
+        }
+        // CARTARC 1 and 2 did not record it; those files are already on disk.
+        None => gzip::inflate_bytes(&buf[data_start..data_start + data_len])
+            .map_err(|e| bad(&format!("cannot decompress: {}", e)))?,
+    };
 
     // An index that carries hashes is used as it is; one that does not gets its
     // hashes recomputed from the bytes, and the Merkle root decides.
@@ -359,8 +388,11 @@ pub fn restore_full(path: &Path) -> io::Result<(Blueprint, Vec<(String, Vec<u8>)
         Vec<IndexedFile>,
         Option<Vec<String>>,
         Option<Blueprint>,
-    ) = if let Some((packed, raw_len)) = index_gz {
-        let bytes = gzip::inflate_bytes(&buf[pos..pos + packed])
+    ) =     if let Some((packed, raw_len)) = index_gz {
+        if raw_len > MAX_INDEX {
+            return Err(bad("the index is larger than an index can be"));
+        }
+        let bytes = crate::inflate::gzip_decompress_limited(&buf[pos..pos + packed], raw_len)
             .map_err(|e| bad(&format!("cannot decompress the index: {}", e)))?;
         if bytes.len() != raw_len {
             return Err(bad("index length disagrees with its header"));
@@ -368,7 +400,10 @@ pub fn restore_full(path: &Path) -> io::Result<(Blueprint, Vec<(String, Vec<u8>)
         let (lens, tree) = decode_index(&bytes).ok_or_else(|| bad("index is corrupt"))?;
         (lens, tree, None, None)
     } else if let Some((packed, raw_len)) = meta_gz {
-        let bytes = gzip::inflate_bytes(&buf[pos..pos + packed])
+        if raw_len > MAX_INDEX {
+            return Err(bad("the index is larger than an index can be"));
+        }
+        let bytes = crate::inflate::gzip_decompress_limited(&buf[pos..pos + packed], raw_len)
             .map_err(|e| bad(&format!("cannot decompress the index: {}", e)))?;
         if bytes.len() != raw_len {
             return Err(bad("index length disagrees with its header"));
@@ -863,6 +898,32 @@ mod tests {
         write_v1(&path, &wrong, &packed);
         let err = restore_full(&path).expect_err("a bad root must be refused");
         assert!(err.to_string().contains("does not match its root"), "{}", err);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_bomb_beyond_the_declared_size_is_refused() {
+        // The header states how many bytes the data section holds, and the
+        // decompressor is capped at exactly that: a small file that expands to
+        // gigabytes stops at the cap instead of taking the box with it.
+        let base = scratch("bomb");
+        let bp = Blueprint { epoch: 1, root: "abc".into(), files: vec![], chunks: vec![] };
+        let index = encode_index(&bp).unwrap();
+        let index_gz = gzip::gzip(&index);
+        let map_gz = gzip::gzip(b"");
+        let data = gzip::gzip(&vec![0u8; 4 * 1024 * 1024]);
+        let mut file = Vec::new();
+        file.extend_from_slice(b"CARTARC 3\nepoch 1\nroot abc\n");
+        file.extend_from_slice(format!("index {} {}\n", index_gz.len(), index.len()).as_bytes());
+        file.extend_from_slice(format!("netmap {} 0\n", map_gz.len()).as_bytes());
+        file.extend_from_slice(format!("data {} 1\n", data.len()).as_bytes());
+        file.extend_from_slice(&index_gz);
+        file.extend_from_slice(&map_gz);
+        file.extend_from_slice(&data);
+        let path = base.join("bomb.cart");
+        fs::write(&path, &file).unwrap();
+        let err = restore_full(&path).expect_err("the bomb must be refused");
+        assert!(err.to_string().contains("decompress"), "{}", err);
         let _ = fs::remove_dir_all(&base);
     }
 

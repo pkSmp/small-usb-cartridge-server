@@ -536,6 +536,18 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_that_ends_exactly_on_the_cap_is_accepted() {
+        // The archive caps decompression at the size its header declares, so a
+        // valid stream that ends on the cap must decode; only one byte more of
+        // output is a refusal.
+        let data = b"the exact size is the size".repeat(100);
+        let packed = gzip(&data);
+        let out = inflate::gzip_decompress_limited(&packed, data.len()).expect("exact cap");
+        assert_eq!(out, data);
+        assert!(inflate::gzip_decompress_limited(&packed, data.len() - 1).is_err());
+    }
+
+    #[test]
     fn round_trips_the_awkward_shapes() {
         roundtrip(b"");
         roundtrip(b"a");

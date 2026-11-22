@@ -272,6 +272,40 @@ it when it differs, and rebuilds and redraws the art. Insert the stick in one
 machine and the logo follows the sites to the others. The file also lives in the
 served tree as `/boot.png`.
 
+## What is trusted
+
+Every input is hostile until it is checked, and the limits live in one place
+(`guard.rs`) so the importer, the archive and the wire cannot disagree about
+them.
+
+- **Request framing.** Only `GET` and `HEAD`, and no request body. A
+  `Transfer-Encoding` header, or a `Content-Length` other than zero, is a 400
+  and the connection closes: a body left in the buffer would be read as the next
+  request, which is the request-smuggling shape.
+- **Paths.** Decoded once, then checked: rooted, no control bytes (a decoded
+  `%0d%0a` inside a `Location` header is response splitting), no dot-prefixed
+  component. `..` never reaches the filesystem, in any encoding.
+- **Ranges.** A range the file cannot satisfy is a 416, not the whole file.
+- **Privileges.** The web tier binds its ports, drops to `nobody`, and refuses to
+  run if the drop fails rather than serving as root.
+- **The fleet key.** `/etc/cartridge/fleet.key` (created by `cartridge fleet
+  key`, mode 0600) makes the fleet closed: a peer must sign its release manifest
+  with HMAC-SHA256 over the exact bytes it sends, its beacon must carry a tag,
+  and the control protocol (blueprint, chunks) already answers only after a
+  nonce challenge. Unsigned manifests and beacons are ignored, so nothing else
+  on the switch can hand a box a release. With no key the fleet stays open, for
+  a single box or a lab.
+- **Everything off the wire is bounded.** Manifest counts, file sizes, totals
+  and every protocol line have the same caps as a stick, and the archive caps
+  decompression at the length its header declares.
+
+Known limits, stated rather than hidden: the CART2 fleet beacon is not signed,
+so a spoofed one can distort the placement map and cause retries (content is
+still verified chunk by chunk); the DNS responder answers any name with the
+fleet's addresses and belongs on a LAN, not the internet; and a release tree may
+contain symlinks (the RAM staging uses them), which the server follows, so a
+release directory must not be writable by anyone else.
+
 ## Where things live
 
 ```
