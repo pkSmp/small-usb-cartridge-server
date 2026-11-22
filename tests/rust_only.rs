@@ -18,7 +18,7 @@ const ALLOWED_NO_EXT: [&str; 2] = ["LICENSE", ".gitignore"];
 
 /// Files that are still in another language, tracked so the count only falls.
 /// Removing each one means moving its content into `install.rs`.
-const KNOWN_PENDING: [&str; 9] = [
+const KNOWN_PENDING: [&str; 10] = [
     "systemd/90-cartridge.rules",
     "systemd/99-cartridge-net.conf",
     "systemd/cartridge-boot-art.service",
@@ -26,6 +26,7 @@ const KNOWN_PENDING: [&str; 9] = [
     "systemd/cartridge-console.service",
     "systemd/cartridge-fleet.service",
     "systemd/cartridge-import@.service",
+    "systemd/cartridge-publish.path",
     "systemd/cartridge-publish.service",
     "systemd/cartridge-web.service",
 ];

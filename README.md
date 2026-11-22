@@ -41,11 +41,19 @@ keeps serving. Web server, import, art and status are all one
 2. **Install it.**
    ```
    install -m 0755 target/release/cartridge /usr/local/bin/cartridge
-   install -m 0644 systemd/*.service /etc/systemd/system/
+   install -m 0644 systemd/*.service systemd/*.path /etc/systemd/system/
    install -m 0644 systemd/90-cartridge.rules /etc/udev/rules.d/
    install -m 0644 systemd/99-cartridge-net.conf /etc/sysctl.d/ && sysctl -p /etc/sysctl.d/99-cartridge-net.conf
-   systemctl daemon-reload && systemctl enable --now cartridge-web cartridge-console
+   # The cluster runs as this account, never as root, and owns what it syncs.
+   useradd --system --no-create-home --shell /usr/sbin/nologin cartridge 2>/dev/null || true
+   mkdir -p /srv/cartridge /var/lib/cartridge
+   chown -R cartridge:cartridge /srv/cartridge /var/lib/cartridge
+   systemctl daemon-reload
+   systemctl enable --now cartridge-web cartridge-console cartridge-publish.path
    ```
+   `cartridge-publish.path` re-stages the release when the cluster activates a
+   new one (the cluster leaves a request flag; staging mounts a tmpfs, which only
+   root may do), so a release pulled from a peer is served without anyone asking.
 3. **Make a cartridge.** Format a stick as FAT32 or ext4, put a `config.json`
    holding `{}` at the root, add one digits-only folder per port and an optional
    `boot.png`, then plug it in. The new sites appear on screen and in the import

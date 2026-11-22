@@ -64,6 +64,25 @@ fn parse_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
     Some((labels.join("."), after))
 }
 
+/// Whether a client is on this box's own network: a /24 for an ordinary LAN, a
+/// /16 inside 10/8 and 172.16/12, and loopback only for loopback.
+pub fn on_our_network(peer: Ipv4Addr, ours: Ipv4Addr) -> bool {
+    if ours.is_loopback() {
+        return peer.is_loopback();
+    }
+    if peer.is_loopback() {
+        return true;
+    }
+    let (a, b) = (peer.octets(), ours.octets());
+    if a[0] == 10 && b[0] == 10 {
+        return a[1] == b[1];
+    }
+    if a[0] == 172 && b[0] == 172 {
+        return a[1] == b[1];
+    }
+    a[..3] == b[..3]
+}
+
 /// Turn one query into one response: the question echoed back, then an A record
 /// per address. Returns `None` for anything that is not a query we understand.
 pub fn respond(query: &[u8], addresses: &[Ipv4Addr]) -> Option<Vec<u8>> {
@@ -120,12 +139,28 @@ pub fn serve(bind: &str, port: u16, addresses: Arc<dyn Fn() -> Vec<Ipv4Addr> + S
     let socket = UdpSocket::bind((bind, port))?;
     socket.set_read_timeout(Some(Duration::from_secs(1)))?;
     let turn = AtomicUsize::new(0);
+    let ours: Ipv4Addr = bind
+        .parse()
+        .ok()
+        .filter(|ip: &Ipv4Addr| !ip.is_unspecified())
+        .or_else(|| crate::sys::lan_ip().parse().ok())
+        .unwrap_or(Ipv4Addr::LOCALHOST);
     let mut buf = [0u8; 1500];
     loop {
         let (n, peer) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             Err(_) => continue,
         };
+        // Only the network this box is on. Answering strangers turns the
+        // responder into a reflector, and a spoofed source address only ever
+        // receives its answers back inside the same network.
+        if let std::net::SocketAddr::V4(v4) = peer {
+            if !on_our_network(*v4.ip(), ours) {
+                continue;
+            }
+        } else {
+            continue;
+        }
         let mut list = addresses();
         if list.len() > 1 {
             let start = turn.fetch_add(1, Ordering::Relaxed) % list.len();
@@ -162,6 +197,18 @@ mod tests {
         assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 2, "two answers");
         assert!(reply.windows(4).any(|w| w == [192, 168, 1, 10]));
         assert!(reply.windows(4).any(|w| w == [192, 168, 1, 11]));
+    }
+
+    #[test]
+    fn only_the_local_network_is_answered() {
+        let ours = Ipv4Addr::new(192, 168, 1, 173);
+        assert!(on_our_network(Ipv4Addr::new(192, 168, 1, 5), ours));
+        assert!(!on_our_network(Ipv4Addr::new(192, 168, 2, 5), ours));
+        assert!(!on_our_network(Ipv4Addr::new(8, 8, 8, 8), ours));
+        assert!(on_our_network(Ipv4Addr::new(10, 1, 9, 9), Ipv4Addr::new(10, 1, 0, 2)));
+        assert!(!on_our_network(Ipv4Addr::new(10, 2, 9, 9), Ipv4Addr::new(10, 1, 0, 2)));
+        assert!(on_our_network(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST));
+        assert!(!on_our_network(Ipv4Addr::new(192, 168, 1, 5), Ipv4Addr::LOCALHOST));
     }
 
     #[test]

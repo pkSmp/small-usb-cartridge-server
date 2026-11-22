@@ -1,0 +1,14 @@
+[Unit]
+Description=Re-stage the release when the cluster asks for it
+# Staging mounts a tmpfs, so it needs root. The unprivileged cluster leaves this
+# flag behind after it activates a release; publish stages it and removes the
+# flag. A flag rather than an inotify watch on the live symlink, because
+# replacing a symlink does not change the file it points at, which is what an
+# inotify watch follows.
+
+[Path]
+PathExists=/var/lib/cartridge/restage
+Unit=cartridge-publish.service
+
+[Install]
+WantedBy=multi-user.target

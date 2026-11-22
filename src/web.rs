@@ -29,6 +29,12 @@ const REVALIDATE: Duration = Duration::from_millis(1000);
 const DATE_LEN: usize = 29;
 /// Stop a pathological site from growing one worker's cache without bound.
 const CACHE_ENTRIES: usize = 8192;
+/// Connections one address may hold in one worker. A single host opening
+/// thousands of sockets must not be able to take the whole worker's budget.
+const PER_IP_LIMIT: u32 = 256;
+/// Where a release is staged; `publish` symlinks the files that did not fit in
+/// RAM back to this tree.
+const LIVE: &str = "/srv/cartridge/live";
 
 extern "C" {
     fn epoll_create1(flags: c_int) -> c_int;
@@ -444,6 +450,7 @@ struct Listener {
 
 struct Conn {
     fd: RawFd,
+    peer: Ipv4Addr,
     root: PathBuf,
     site: usize,
     inbuf: Vec<u8>,
@@ -463,9 +470,10 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(fd: RawFd, root: PathBuf, site: usize) -> Conn {
+    fn new(fd: RawFd, root: PathBuf, site: usize, peer: Ipv4Addr) -> Conn {
         Conn {
             fd,
+            peer,
             root,
             site,
             inbuf: Vec::with_capacity(READ_BUF),
@@ -554,6 +562,30 @@ fn path_error(decoded: &str) -> Option<u16> {
         return Some(403);
     }
     None
+}
+
+/// sockaddr_in for `accept4`: 16 bytes, family and port in network order.
+#[repr(C)]
+struct PeerAddr {
+    family: u16,
+    port: u16,
+    addr: [u8; 4],
+    zero: [u8; 8],
+}
+
+/// Close a connection and give its address's slot back.
+fn forget(conns: &mut HashMap<RawFd, Conn>, per_ip: &mut HashMap<Ipv4Addr, u32>, fd: RawFd) {
+    if let Some(c) = conns.remove(&fd) {
+        if let Some(n) = per_ip.get_mut(&c.peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                per_ip.remove(&c.peer);
+            }
+        }
+        unsafe {
+            close(fd);
+        }
+    }
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -691,10 +723,11 @@ fn partial(
     head.extend_from_slice(len.to_string().as_bytes());
     head.extend_from_slice(b"\r\nETag: ");
     head.extend_from_slice(c.etag.as_bytes());
+    head.extend_from_slice(b"\r\nAccept-Ranges: bytes\r\nVary: Accept-Encoding\r\n");
     head.extend_from_slice(if keep {
-        &b"\r\nConnection: keep-alive\r\n\r\n"[..]
+        &b"Connection: keep-alive\r\n\r\n"[..]
     } else {
-        &b"\r\nConnection: close\r\n\r\n"[..]
+        &b"Connection: close\r\n\r\n"[..]
     });
     conn.queue(head, None, start as i64, 0);
     if !keep {
@@ -825,6 +858,25 @@ fn flush(conn: &mut Conn) -> io::Result<bool> {
     Ok(true)
 }
 
+/// A file may only be served from inside the site root, or from the release the
+/// RAM staging links back to. A symlink in a release must not turn into a way
+/// to read the host.
+fn contained(path: &Path, root: &Path) -> bool {
+    let real = match fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if let Ok(r) = fs::canonicalize(root) {
+        if real.starts_with(&r) {
+            return true;
+        }
+    }
+    match fs::canonicalize(LIVE) {
+        Ok(live) => real.starts_with(live),
+        Err(_) => false,
+    }
+}
+
 /// Resolve the request path into a file, following the one directory rule the
 /// server has: `/` means `index.html`.
 fn locate(root: &Path, decoded: &str) -> Locate {
@@ -835,7 +887,7 @@ fn locate(root: &Path, decoded: &str) -> Locate {
     if decoded.ends_with('/') {
         for name in ["index.html", "index.htm"] {
             let candidate = path.join(name);
-            if candidate.is_file() {
+            if candidate.is_file() && contained(&candidate, root) {
                 return Locate::File(candidate);
             }
         }
@@ -846,7 +898,8 @@ fn locate(root: &Path, decoded: &str) -> Locate {
     }
     match fs::metadata(&path) {
         Ok(meta) if meta.is_dir() => Locate::Redirect,
-        Ok(_) => Locate::File(path),
+        Ok(_) if contained(&path, root) => Locate::File(path),
+        Ok(_) => Locate::Forbidden,
         Err(_) => Locate::Missing,
     }
 }
@@ -955,6 +1008,7 @@ fn handle_request(
     let mut if_none_match_etag: Option<&str> = None;
     let mut if_modified_raw: Option<&str> = None;
     let mut range_raw: Option<&str> = None;
+    let mut if_range_raw: Option<&str> = None;
     let mut accept_gzip = false;
     // This server never accepts a request body. A message that carries one
     // would leave its bytes in the buffer, where they would be read as the next
@@ -970,6 +1024,8 @@ fn handle_request(
             if_modified_raw = line.split_once(':').map(|(_, v)| v.trim());
         } else if lower.starts_with("range:") {
             range_raw = line.split_once(':').map(|(_, v)| v.trim());
+        } else if lower.starts_with("if-range:") {
+            if_range_raw = line.split_once(':').map(|(_, v)| v.trim());
         } else if lower.starts_with("accept-encoding:") {
             accept_gzip = lower.contains("gzip");
         } else if lower.starts_with("transfer-encoding:") {
@@ -1005,7 +1061,16 @@ fn handle_request(
     };
     if fresh {
         let c = cache.get_mut(decoded.as_str()).unwrap();
-        let req = build_req(c, head_only, keep, if_none_match_etag, if_modified_raw, range_raw, accept_gzip);
+        let req = build_req(
+            c,
+            head_only,
+            keep,
+            if_none_match_etag,
+            if_modified_raw,
+            range_raw,
+            if_range_raw,
+            accept_gzip,
+        );
         return deliver(c, conn, &req, clock);
     }
 
@@ -1057,7 +1122,16 @@ fn handle_request(
         cache.insert(key, c);
     }
     let c = cache.get_mut(decoded.as_str()).unwrap();
-    let req = build_req(c, head_only, keep, if_none_match_etag, if_modified_raw, range_raw, accept_gzip);
+    let req = build_req(
+        c,
+        head_only,
+        keep,
+        if_none_match_etag,
+        if_modified_raw,
+        range_raw,
+        if_range_raw,
+        accept_gzip,
+    );
     deliver(c, conn, &req, clock)
 }
 
@@ -1103,8 +1177,15 @@ fn build_req(
     inm: Option<&str>,
     if_modified: Option<&str>,
     range: Option<&str>,
+    if_range: Option<&str>,
     accept_gzip: bool,
 ) -> Req {
+    // `If-Range` asks for the range only while the file is still the one the
+    // client saw; a changed file means the whole thing, not a wrong slice.
+    let range = match if_range {
+        Some(v) if v.trim() != c.etag => None,
+        _ => range,
+    };
     let if_none_match = match inm {
         Some(v) => v.split(',').any(|t| t.trim() == c.etag),
         None => false,
@@ -1137,6 +1218,7 @@ fn worker(listeners: Vec<Listener>, slot: usize) {
 
     let sites = listeners.len();
     let mut conns: HashMap<RawFd, Conn> = HashMap::new();
+    let mut per_ip: HashMap<Ipv4Addr, u32> = HashMap::new();
     let mut caches: Vec<HashMap<String, Cached>> = (0..sites).map(|_| HashMap::new()).collect();
     let mut clock = Clock::new();
     let mut events = vec![EpollEvent { events: 0, data: 0 }; 512];
@@ -1180,8 +1262,15 @@ fn worker(listeners: Vec<Listener>, slot: usize) {
                 };
                 let mut pause_streak = 0u32;
                 loop {
+                    let mut addr = PeerAddr { family: 0, port: 0, addr: [0; 4], zero: [0; 8] };
+                    let mut addr_len = std::mem::size_of::<PeerAddr>() as u32;
                     let client = unsafe {
-                        accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), SOCK_NONBLOCK | SOCK_CLOEXEC)
+                        accept4(
+                            fd,
+                            &mut addr as *mut _ as *mut c_void,
+                            &mut addr_len,
+                            SOCK_NONBLOCK | SOCK_CLOEXEC,
+                        )
                     };
                     if client < 0 {
                         match crate::guard::accept_action(crate::sys::errno()) {
@@ -1212,11 +1301,18 @@ fn worker(listeners: Vec<Listener>, slot: usize) {
                         unsafe { close(client) };
                         break;
                     }
+                    let peer = Ipv4Addr::from(addr.addr);
+                    let held = per_ip.get(&peer).copied().unwrap_or(0);
+                    if held >= PER_IP_LIMIT {
+                        unsafe { close(client) };
+                        continue;
+                    }
+                    *per_ip.entry(peer).or_insert(0) += 1;
                     let token = (client as u64) << 1 | 1;
                     add_epoll(epfd, client, EPOLLIN | EPOLLRDHUP | EPOLLET, token);
                     conns.insert(
                         client,
-                        Conn::new(client, listener.root.clone(), listener.site),
+                        Conn::new(client, listener.root.clone(), listener.site, peer),
                     );
                 }
             } else {
@@ -1321,10 +1417,7 @@ fn worker(listeners: Vec<Listener>, slot: usize) {
                     mod_epoll(epfd, fd, want, token);
                 }
                 if drop_conn {
-                    conns.remove(&fd);
-                    unsafe {
-                        close(fd);
-                    }
+                    forget(&mut conns, &mut per_ip, fd);
                 }
             }
         }
@@ -1348,10 +1441,7 @@ fn worker(listeners: Vec<Listener>, slot: usize) {
                 .map(|(fd, _)| *fd)
                 .collect();
             for fd in expired {
-                conns.remove(&fd);
-                unsafe {
-                    close(fd);
-                }
+                forget(&mut conns, &mut per_ip, fd);
             }
             next_sweep = now + Duration::from_secs(1);
         }

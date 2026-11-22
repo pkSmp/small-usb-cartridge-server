@@ -46,7 +46,9 @@ pub const DEFAULT_CONTROL: u16 = 29701;
 const BEACON_EVERY: Duration = Duration::from_millis(500);
 const PEER_TTL: Duration = Duration::from_secs(4);
 const SYNC_EVERY: Duration = Duration::from_secs(2);
-const STATE_FILE: &str = "/run/cartridge-cluster.json";
+/// In `/var/lib`, not `/run`: the cluster may run unprivileged, and `/run` is
+/// root-owned. `/var/lib/cartridge` is handed to the account it drops to.
+const STATE_FILE: &str = "/var/lib/cartridge/cluster.json";
 const RELEASES: &str = "/srv/cartridge/releases";
 const LIVE: &str = "/srv/cartridge/live";
 const LOG_FILE: &str = "/var/log/cartridge/import.log";
@@ -810,7 +812,17 @@ fn activate(name: &str) -> Result<(), String> {
     fs::rename(&live_new, LIVE).map_err(|e| e.to_string())?;
     prune(name);
     sys::sync();
-    crate::publish::run().map(|_| ())
+    // Staging mounts a tmpfs, so it needs root. An unprivileged cluster leaves
+    // a request flag and `cartridge-publish.path` runs publish as root.
+    if crate::sys::is_root() {
+        if let Err(e) = crate::publish::run() {
+            log("warn", &format!("cluster: could not stage the release in RAM: {}", e));
+        }
+    } else {
+        // `cartridge-publish.path` sees this flag and runs publish as root.
+        let _ = fs::write("/var/lib/cartridge/restage", format!("{}\n", name));
+    }
+    Ok(())
 }
 
 fn sync_once(shared: &Arc<Shared>, tried: &mut HashMap<String, Instant>) {
@@ -1023,6 +1035,9 @@ fn state_text(shared: &Shared) -> String {
 
 fn write_state(shared: &Shared) {
     let text = state_text(shared);
+    if let Some(parent) = Path::new(STATE_FILE).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     let temp = format!("{}.new", STATE_FILE);
     if fs::write(&temp, text).is_ok() {
         let _ = fs::rename(&temp, STATE_FILE);
@@ -2088,6 +2103,59 @@ pub fn run(
         );
     }
 
+    // Relay on every core, sharing the public ports with SO_REUSEPORT the same
+    // way the web tier spreads its workers: the kernel balances the accepted
+    // connections, so the relay is never one thread's bottleneck. Bound before
+    // the privilege drop, because a site on port 80 can only be bound as root.
+    let mut sets: Vec<Vec<(RawFd, usize)>> = vec![listeners];
+    for _ in 1..worker_count {
+        let mut set = Vec::new();
+        for (i, port) in ports.iter().enumerate() {
+            if let Ok(fd) = bind_public(*port) {
+                set.push((fd, i));
+            }
+        }
+        if set.len() == ports.len() {
+            sets.push(set);
+        } else {
+            for (fd, _) in set {
+                unsafe {
+                    close(fd);
+                }
+            }
+        }
+    }
+
+    // Give up root now that the ports are bound. It keeps the store, the state
+    // file and the release directories, so those have to belong to the account
+    // it drops to; if they do not, running as root is the only way to keep
+    // syncing and the warning says exactly what to chown.
+    let account = std::env::var("CARTRIDGE_USER").unwrap_or_else(|_| "cartridge".to_string());
+    let _ = fs::create_dir_all("/var/lib/cartridge");
+    match crate::sys::user_id(&account) {
+        Some((uid, gid)) if crate::sys::owner(RELEASES).map(|(u, _)| u) == Some(uid) => {
+            if !crate::sys::drop_to(uid, gid) {
+                return Err("cluster: could not drop root privileges".into());
+            }
+            log("ok", &format!("cluster: running as {}, not root", account));
+        }
+        Some(_) => log(
+            "warn",
+            &format!(
+                "cluster: {} is not owned by {} - running as root; chown -R {} {} to drop",
+                RELEASES, account, account, RELEASES
+            ),
+        ),
+        None if crate::sys::is_root() => log(
+            "warn",
+            &format!(
+                "cluster: no {} account and this runs as root; create it and chown {} to it",
+                account, RELEASES
+            ),
+        ),
+        None => {}
+    }
+
     {
         let s = shared.clone();
         std::thread::spawn(move || beacon_send(s, beacon));
@@ -2110,28 +2178,6 @@ pub fn run(
                 sys::sleep_ms(SYNC_EVERY.as_millis() as u64);
             }
         });
-    }
-
-    // Relay on every core, sharing the public ports with SO_REUSEPORT the same
-    // way the web tier spreads its workers: the kernel balances the accepted
-    // connections, so the relay is never one thread's bottleneck.
-    let mut sets: Vec<Vec<(RawFd, usize)>> = vec![listeners];
-    for _ in 1..worker_count {
-        let mut set = Vec::new();
-        for (i, port) in ports.iter().enumerate() {
-            if let Ok(fd) = bind_public(*port) {
-                set.push((fd, i));
-            }
-        }
-        if set.len() == ports.len() {
-            sets.push(set);
-        } else {
-            for (fd, _) in set {
-                unsafe {
-                    close(fd);
-                }
-            }
-        }
     }
     let mut iter = sets.into_iter();
     let first = iter.next().unwrap_or_default();

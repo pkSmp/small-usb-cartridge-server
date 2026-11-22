@@ -448,6 +448,9 @@ fn import_from(dev: &str, mnt: &str, mounted_here: bool) -> Result<i32, String> 
     let stamp = sys::fmt_time("%Y%m%d-%H%M%S");
     let release = format!("{}/{}", RELEASES, stamp);
     fs::rename(&staging, &release).map_err(|e| e.to_string())?;
+    // The cluster may run unprivileged, and it is the one that prunes and
+    // replaces releases; a root-owned tree it cannot touch would stop syncing.
+    crate::fleet::hand_to_cluster(Path::new(&release));
     let live_new = format!("{}.new", LIVE);
     let _ = fs::remove_file(&live_new);
     std::os::unix::fs::symlink(&release, &live_new).map_err(|e| e.to_string())?;

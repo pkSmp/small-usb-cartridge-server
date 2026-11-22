@@ -138,6 +138,10 @@ pub fn run() -> Result<i32, String> {
     let total = measure(&release, true);
     let sites = ports_of(&release).len() as u64;
 
+    // Clear the cluster's re-stage request first, so a failing run does not leave
+    // the path unit armed forever.
+    let _ = fs::remove_file("/var/lib/cartridge/restage");
+
     let total_kb = machine::mem_total_kb();
     let avail_kb = machine::mem_avail_kb();
     // Never take more than half of RAM, and always keep a quarter in reserve.

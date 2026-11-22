@@ -506,6 +506,83 @@ pub fn lan_ip() -> String {
     read_trim("/proc/sys/kernel/hostname").unwrap_or_else(|| "127.0.0.1".into())
 }
 
+/// The uid/gid that own a path, if it exists.
+pub fn owner(path: &str) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.uid(), meta.gid()))
+}
+
+/// A system account's ids, from `/etc/passwd`.
+pub fn user_id(name: &str) -> Option<(u32, u32)> {
+    let text = fs::read_to_string("/etc/passwd").ok()?;
+    for line in text.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() >= 4 && f[0] == name {
+            return Some((f[2].parse().ok()?, f[3].parse().ok()?));
+        }
+    }
+    None
+}
+
+/// Give a tree to another user. The importer runs as root because it mounts,
+/// so without this every release it writes is root-owned and an unprivileged
+/// cluster could not replace or prune it.
+pub fn chown_tree(path: &str, uid: u32, gid: u32) {
+    chown_walk(Path::new(path), uid, gid);
+}
+
+fn chown_walk(path: &Path, uid: u32, gid: u32) {
+    extern "C" {
+        fn lchown(path: *const std::os::raw::c_char, uid: u32, gid: u32) -> std::os::raw::c_int;
+    }
+    if let Ok(c) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
+        unsafe {
+            lchown(c.as_ptr(), uid, gid);
+        }
+    }
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => chown_walk(&child, uid, gid),
+            _ => {
+                if let Ok(c) = std::ffi::CString::new(child.to_string_lossy().as_bytes()) {
+                    unsafe {
+                        lchown(c.as_ptr(), uid, gid);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn is_root() -> bool {
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() == 0 }
+}
+
+/// Drop root for good. Returns true when the process really is unprivileged.
+pub fn drop_to(uid: u32, gid: u32) -> bool {
+    extern "C" {
+        fn setgroups(n: usize, list: *const u32) -> std::os::raw::c_int;
+        fn setgid(gid: u32) -> std::os::raw::c_int;
+        fn setuid(uid: u32) -> std::os::raw::c_int;
+        fn geteuid() -> u32;
+    }
+    unsafe {
+        setgroups(0, std::ptr::null());
+        setgid(gid);
+        setuid(uid);
+        geteuid() != 0
+    }
+}
+
 pub struct Usb {
     pub dev: String,
     pub size: String,

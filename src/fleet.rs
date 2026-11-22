@@ -332,6 +332,14 @@ impl Node {
             line.push(' ');
             line.push_str(&field);
         }
+        // With a fleet key the beacon is signed, so a machine on the switch
+        // cannot claim to be a node, a release or a chunk holder. The tag is
+        // the last field and the spec parser ignores it.
+        if let Some(key) = &self.key {
+            let tag = auth::tag(key, line.as_bytes());
+            line.push(' ');
+            line.push_str(&tag);
+        }
         line.push('\n');
         line
     }
@@ -382,8 +390,20 @@ impl Node {
 
 // -------------------------------------------------------------------- wire
 
-fn parse_beacon(line: &str, ip: Ipv4Addr) -> Option<Member> {
-    let f: Vec<&str> = line.split_whitespace().collect();
+fn parse_beacon(line: &str, ip: Ipv4Addr, secret: Option<&Vec<u8>>) -> Option<Member> {
+    let text = line.trim_end();
+    // A signed fleet trusts only beacons that carry a valid tag.
+    let text = match secret {
+        Some(key) => {
+            let (body, tag) = text.rsplit_once(' ')?;
+            if !auth::verify(key, body.as_bytes(), tag) {
+                return None;
+            }
+            body
+        }
+        None => text,
+    };
+    let f: Vec<&str> = text.split_whitespace().collect();
     if f.len() < 23 || f[0] != "CART2" {
         return None;
     }
@@ -644,7 +664,7 @@ fn beacon_recv(node: Arc<Node>, port: u16) {
             std::net::IpAddr::V4(v4) => v4,
             _ => continue,
         };
-        if let Some(member) = parse_beacon(text.trim_end(), ip) {
+        if let Some(member) = parse_beacon(text.trim_end(), ip, node.key.as_ref()) {
             if member.id == node.me.id {
                 continue;
             }
@@ -890,6 +910,20 @@ pub fn restore_into(path: &Path, store: &Store, releases: &Path) -> io::Result<(
     Ok((bp, chunks.len()))
 }
 
+/// Hand a release to the account the cluster runs as. The importer and the
+/// fleet daemon lay releases down as root; without this they would be
+/// root-owned, and the unprivileged cluster could not prune or replace them.
+pub fn hand_to_cluster(path: &Path) {
+    let account = std::env::var("CARTRIDGE_USER").unwrap_or_else(|_| "cartridge".to_string());
+    let Some((uid, gid)) = crate::sys::user_id(&account) else {
+        return;
+    };
+    if crate::sys::owner(&releases_root().to_string_lossy()).map(|(u, _)| u) != Some(uid) {
+        return;
+    }
+    crate::sys::chown_tree(&path.to_string_lossy(), uid, gid);
+}
+
 /// `cartridge fleet restore FILE`: rebuild this box from an archive on disk.
 /// Deliberately offline: an operator restoring the last surviving copy should
 /// not have to have a working fleet first.
@@ -901,6 +935,7 @@ pub fn restore_from(file: &str) -> Result<i32, String> {
     persist_blueprint(&store, &releases_root(), &bp)
         .map_err(|e| format!("cannot write the blueprint: {}", e))?;
     let target = releases_root().join(bp.epoch.to_string());
+    hand_to_cluster(&target);
     let live = live_path();
     let tmp = releases_root().join(".live-restore");
     let _ = fs::remove_file(&tmp);
@@ -941,6 +976,7 @@ fn activate(node: &Arc<Node>, epoch: u64) {
         let _ = fs::remove_file(&tmp);
         return;
     }
+    hand_to_cluster(&dir);
     *node.epoch.lock().unwrap() = epoch;
     node.ready.store(epoch, Ordering::Relaxed);
     *node.pending.lock().unwrap() = None;
@@ -1778,7 +1814,7 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let node = node_with(&dir);
         let line = node.beacon_line();
-        let member = parse_beacon(line.trim_end(), Ipv4Addr::new(10, 0, 0, 5)).unwrap();
+        let member = parse_beacon(line.trim_end(), Ipv4Addr::new(10, 0, 0, 5), None).unwrap();
         assert_eq!(member.id, 7);
         assert_eq!(member.name, "seven");
         assert_eq!(member.control, CONTROL);
@@ -1787,7 +1823,36 @@ mod tests {
         assert_eq!(member.spec.disk_free_mb, 100_000);
         assert_eq!(member.key, ident::key_of(7));
         // An old line, without the spec fields, is ignored rather than trusted.
-        assert!(parse_beacon("CART2 07 seven 0 0 29702 - 0 0 0 0", Ipv4Addr::LOCALHOST).is_none());
+        assert!(parse_beacon("CART2 07 seven 0 0 29702 - 0 0 0 0", Ipv4Addr::LOCALHOST, None).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_beacon_must_be_signed_once_a_key_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "cartridge-fleet-sign-{}-{}",
+            std::process::id(),
+            ident::random_u128() & 0xffff
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let node = node_with(&dir);
+        let body = node.beacon_line();
+        let body = body.trim_end();
+        let key = b"fleet".to_vec();
+        let signed = format!("{} {}", body, auth::tag(&key, body.as_bytes()));
+        let from = Ipv4Addr::new(10, 0, 0, 5);
+        assert!(parse_beacon(&signed, from, Some(&key)).is_some());
+        assert!(
+            parse_beacon(body, from, Some(&key)).is_none(),
+            "an unsigned beacon must be ignored once a key exists"
+        );
+        let tampered = format!("{} {}", body.replace("seven", "seven2"), auth::tag(&key, body.as_bytes()));
+        assert!(
+            parse_beacon(&tampered, from, Some(&key)).is_none(),
+            "a changed body must fail its tag"
+        );
+        // With no key provisioned the fleet stays open, as documented.
+        assert!(parse_beacon(body, from, None).is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 
