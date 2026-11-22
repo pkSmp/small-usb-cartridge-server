@@ -713,8 +713,8 @@ pub fn build(img: &Image, cal: &Calib, origin_x: usize) -> BuildReport {
     let mut payload = String::from("\x1b[0m\x1b[?25l");
     let mut expected = Image::new(img.w, img.h);
     for r in 0..rows {
-        // Centred by the build: the blank columns are split evenly on both
-        // sides instead of the picture hugging the left edge.
+        // The picture starts at its origin column; it has always been the
+        // first column, so the art sits where it always sat.
         payload.push_str(&format!("\x1b[{};{}H", r + 1, origin_x + 1));
         for x in 0..img.w {
             let top = grid[2 * r][x];
@@ -893,13 +893,10 @@ pub fn cmd_build(image: &str, out: &str) -> Result<i32, String> {
     } else {
         println!("fit: {}x{} px ({}x{} cells) fits the console", img.w, img.h, img.w, img.h.div_ceil(2));
     }
-    // Centre the picture in the console. A narrow image left-aligned on a
-    // 240-column TV leaves a dead band down one side and reads as a mistake.
-    let origin_x = cols.saturating_sub(img.w) / 2;
+    // Top-left, exactly as before the voice stack was removed: the picture
+    // starts at column 1 and the report runs from the row under it.
+    let origin_x = 0;
     let report = build(&img, &cal, origin_x);
-    if origin_x > 0 {
-        println!("place: row 1, column {} (centred, {} blank each side)", origin_x + 1, origin_x);
-    }
 
     fs::create_dir_all(out).map_err(|e| format!("cannot create {}: {}", out, e))?;
     fs::write(format!("{}/art.bin", out), &report.art).map_err(|e| e.to_string())?;
