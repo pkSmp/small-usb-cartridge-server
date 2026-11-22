@@ -36,11 +36,12 @@ fn probe() -> bool {
 }
 
 fn cell_char(x: usize, y: usize) -> Option<u8> {
+    // /dev/vcs1 holds one byte per cell: the character, nothing else.
     let data = fs::read("/dev/vcs1").ok()?;
-    if data.len() < (y * 240 + x) * 2 + 1 {
+    if data.len() < y * 240 + x + 1 {
         return None;
     }
-    Some(data[(y * 240 + x) * 2])
+    Some(data[y * 240 + x])
 }
 
 fn ensure_font() -> bool {
