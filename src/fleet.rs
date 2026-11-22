@@ -1078,9 +1078,10 @@ fn archive_loop(node: Arc<Node>) {
         let map = netmap_text(&node).unwrap_or_default();
         match crate::archive::build_with_map(&bp2, &store, &path, &map) {
             Ok(r) => node2.note(format!(
-                "archive for epoch {}: {} -> {}",
+                "archive for epoch {}: {} -> {} (data {})",
                 bp.epoch,
                 sys::human(r.raw),
+                sys::human(r.total),
                 sys::human(r.packed)
             )),
             Err(e) => log("warn", &format!("archive failed: {}", e)),
@@ -1697,9 +1698,10 @@ pub fn archive_now() -> Result<i32, String> {
     let map = fs::read_to_string(netmap_path()).unwrap_or_default();
     let report = crate::archive::build_with_map(&bp, &store, &path, &map).map_err(|e| e.to_string())?;
     println!(
-        "{}: {} -> {} ({} chunks)",
+        "{}: {} -> {} (data {}, {} chunks)",
         report.path.display(),
         sys::human(report.raw),
+        sys::human(report.total),
         sys::human(report.packed),
         report.chunks
     );

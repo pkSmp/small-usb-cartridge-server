@@ -1,20 +1,44 @@
 //! A deflate (RFC 1951) and gzip (RFC 1952) encoder, in std only.
 //!
-//! There is no compression library to link, so the fleet builds its own. The
-//! encoder is deliberately simple: a greedy LZ77 pass with a 32 KiB window, and
-//! deflate's *fixed* Huffman tables, which need no code-length header and are
-//! within a few percent of a tuned encoder on the text a static site is made of.
-//! It is used for two things: pre-compressed variants of every text asset, so
-//! the hot path ships fewer bytes, and the disaster-recovery archive.
+//! There is no compression library to link, so the fleet builds its own. This
+//! encoder exists for one job now: the disaster-recovery archive, where the
+//! smallest possible file matters more than the milliseconds it takes (it is
+//! built by the idle class, never while serving).
 //!
-//! Decoding is not duplicated here — `inflate.rs` already has a decoder, and the
-//! tests round-trip through it.
+//! What it does to get there:
+//!
+//!   * **Lazy matching.** A match is only taken when the next byte does not
+//!     start a longer one, which is the single cheapest ratio win in LZ77.
+//!   * **Deep chains.** A 64K-entry hash table and up to 128 candidates per
+//!     position, instead of 32K and 48.
+//!   * **Dynamic Huffman.** Every block carries its own literal/length and
+//!     distance tables, built with package-merge so they are optimal under
+//!     deflate's 15-bit limit. Fixed tables cost 8 bits for every lowercase
+//!     letter; a real table costs about 4-5 on text.
+//!   * **A window-sized chain array.** Candidate links live in a ring of
+//!     `WINDOW` entries rather than one entry per input byte, so a 300 MB
+//!     release no longer needs gigabytes to compress.
+//!
+//! Blocks are flushed every 128K tokens: each one gets fresh tables, which
+//! bounds memory and lets a block that is unlike its neighbours use its own
+//! alphabet. Tiny blocks stay on the fixed tables, where a header would cost
+//! more than it saves.
+//!
+//! Decoding is not duplicated here — `inflate.rs` already has a decoder that
+//! handles both block types, and every test round-trips through it.
 
 const WINDOW: usize = 32 * 1024;
 const MAX_MATCH: usize = 258;
 const MIN_MATCH: usize = 3;
-const HASH_BITS: usize = 15;
-const MAX_CHAIN: usize = 48;
+const HASH_BITS: usize = 16;
+const HASH_SIZE: usize = 1 << HASH_BITS;
+const MAX_CHAIN: usize = 128;
+/// Tokens per block: bounds the token list and the cost of one bad table.
+const BLOCK_TOKENS: usize = 1 << 17;
+/// Deflate's limit for literal/length and distance codes.
+const MAX_BITS: usize = 15;
+/// Deflate's limit for the code-length alphabet.
+const MAX_CL_BITS: usize = 7;
 
 const LEN_BASE: [u16; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
@@ -31,6 +55,14 @@ const DIST_EXTRA: [u8; 30] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
     13, 13,
 ];
+/// The order deflate writes code-length code lengths in.
+const CL_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+#[derive(Clone, Copy)]
+enum Tok {
+    Lit(u8),
+    Match { len: u16, dist: u16 },
+}
 
 struct BitOut {
     out: Vec<u8>,
@@ -46,6 +78,9 @@ impl BitOut {
     /// Bits go into the stream least-significant first, which is what deflate
     /// requires for values and extra bits.
     fn put(&mut self, value: u32, bits: u32) {
+        if bits == 0 {
+            return;
+        }
         self.acc |= (value & ((1u32 << bits) - 1)) << self.bits;
         self.bits += bits;
         while self.bits >= 8 {
@@ -73,15 +108,14 @@ impl BitOut {
     }
 }
 
-fn lit_code(bits: &mut BitOut, byte: u8) {
+fn fixed_lit_code(bits: &mut BitOut, byte: u8) {
     match byte {
         0..=143 => bits.put_code(0x30 + byte as u32, 8),
-        144..=255 => bits.put_code(0x190 + (byte as u32 - 144), 9),
-        _ => unreachable!(),
+        _ => bits.put_code(0x190 + (byte as u32 - 144), 9),
     }
 }
 
-fn length_code(bits: &mut BitOut, symbol: u32) {
+fn fixed_length_code(bits: &mut BitOut, symbol: u32) {
     // 257..=279 are seven bits from zero, 280..=287 eight bits from 0xC0.
     if symbol <= 279 {
         bits.put_code(symbol - 256, 7);
@@ -101,9 +135,8 @@ fn find_length(len: usize) -> (usize, u32) {
 }
 
 fn find_distance(dist: usize) -> (usize, u32) {
-    // Deflate's distance codes are 1-based: code 0 covers distance 1, and the
-    // extra bits carry `dist - base`. Subtracting one here underflowed at
-    // distance 1 and corrupted every stream that used it.
+    // Distance codes are 1-based: code 0 covers distance 1, and the extra bits
+    // carry `dist - base`.
     let mut idx = 0;
     for i in 0..DIST_BASE.len() {
         if dist >= DIST_BASE[i] as usize {
@@ -115,86 +148,346 @@ fn find_distance(dist: usize) -> (usize, u32) {
 
 fn hash3(data: &[u8], pos: usize) -> usize {
     let v = (data[pos] as u32) | ((data[pos + 1] as u32) << 8) | ((data[pos + 2] as u32) << 16);
-    (v.wrapping_mul(0x1e35_a7bd) >> (32 - HASH_BITS)) as usize & ((1 << HASH_BITS) - 1)
+    (v.wrapping_mul(0x1e35_a7bd) >> (32 - HASH_BITS)) as usize & (HASH_SIZE - 1)
 }
 
-/// Raw deflate, one final fixed-Huffman block.
-pub fn deflate(data: &[u8]) -> Vec<u8> {
-    let mut bits = BitOut::new();
-    bits.put(1, 1); // BFINAL
-    bits.put(1, 2); // BTYPE = 01, fixed Huffman
-
-    let n = data.len();
-    let mut head = vec![usize::MAX; 1 << HASH_BITS];
-    let mut prev = vec![usize::MAX; n.max(1)];
-    let mut pos = 0usize;
-    while pos < n {
-        let (mut best_len, mut best_dist) = (0usize, 0usize);
-        if pos + MIN_MATCH <= n {
-            let h = hash3(data, pos);
-            let mut cand = head[h];
-            let mut tries = 0;
-            while cand != usize::MAX && tries < MAX_CHAIN {
-                if pos <= cand || pos - cand > WINDOW {
-                    if pos <= cand {
-                        break;
-                    }
-                    cand = prev[cand];
-                    tries += 1;
-                    continue;
-                }
-                let limit = MAX_MATCH.min(n - pos);
-                let mut len = 0usize;
-                while len < limit && data[cand + len] == data[pos + len] {
-                    len += 1;
-                }
-                if len > best_len {
-                    best_len = len;
-                    best_dist = pos - cand;
-                    if len >= limit {
-                        break;
-                    }
-                }
-                cand = prev[cand];
-                tries += 1;
+/// Longest match at `pos`, searching the chains newest-first.
+fn longest(data: &[u8], head: &[usize], prev: &[usize], pos: usize) -> (usize, usize) {
+    if pos + MIN_MATCH > data.len() {
+        return (0, 0);
+    }
+    let mut cand = head[hash3(data, pos)];
+    let limit = MAX_MATCH.min(data.len() - pos);
+    let (mut best_len, mut best_dist) = (0usize, 0usize);
+    let mut tries = 0;
+    while cand != usize::MAX && tries < MAX_CHAIN {
+        if cand >= pos {
+            break;
+        }
+        let dist = pos - cand;
+        if dist > WINDOW {
+            // The chain is newest-first, so everything further back is older.
+            // The ring can alias, so keep walking rather than trusting order.
+            cand = prev[cand & (WINDOW - 1)];
+            tries += 1;
+            continue;
+        }
+        let mut len = 0usize;
+        while len < limit && data[cand + len] == data[pos + len] {
+            len += 1;
+        }
+        if len > best_len {
+            best_len = len;
+            best_dist = dist;
+            if len >= limit {
+                break;
             }
         }
+        cand = prev[cand & (WINDOW - 1)];
+        tries += 1;
+    }
+    if best_len < MIN_MATCH {
+        (0, 0)
+    } else {
+        (best_len, best_dist)
+    }
+}
 
-        if best_len >= MIN_MATCH {
-            let (idx, extra) = find_length(best_len);
-            length_code(&mut bits, 257 + idx as u32);
-            if LEN_EXTRA[idx] > 0 {
-                bits.put(extra, LEN_EXTRA[idx] as u32);
-            }
-            let (didx, dextra) = find_distance(best_dist);
-            bits.put_code(didx as u32, 5);
-            if DIST_EXTRA[didx] > 0 {
-                bits.put(dextra, DIST_EXTRA[didx] as u32);
-            }
-            // Every position inside the match joins the hash chains, or later
-            // matches would miss what just went past.
-            for k in 0..best_len {
-                let p = pos + k;
-                if p + MIN_MATCH <= n {
-                    let h = hash3(data, p);
-                    prev[p] = head[h];
-                    head[h] = p;
+fn insert(data: &[u8], head: &mut [usize], prev: &mut [usize], pos: usize) {
+    if pos + MIN_MATCH > data.len() {
+        return;
+    }
+    let h = hash3(data, pos);
+    prev[pos & (WINDOW - 1)] = head[h];
+    head[h] = pos;
+}
+
+/// The LZ77 pass: literals and matches, with one step of lazy matching.
+fn lz77(data: &[u8]) -> Vec<Tok> {
+    let mut head = vec![usize::MAX; HASH_SIZE];
+    let mut prev = vec![usize::MAX; WINDOW];
+    let mut out = Vec::with_capacity(data.len() / 2 + 1);
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let (len, dist) = longest(data, &head, &prev, pos);
+        if len >= MIN_MATCH {
+            if pos + 1 < data.len() {
+                // Make this position available to the search at pos + 1.
+                insert(data, &mut head, &mut prev, pos);
+                let (next_len, _) = longest(data, &head, &prev, pos + 1);
+                if next_len > len {
+                    out.push(Tok::Lit(data[pos]));
+                    pos += 1;
+                    continue;
                 }
+            } else {
+                insert(data, &mut head, &mut prev, pos);
             }
-            pos += best_len;
+            out.push(Tok::Match { len: len as u16, dist: dist as u16 });
+            for k in 1..len {
+                insert(data, &mut head, &mut prev, pos + k);
+            }
+            pos += len;
         } else {
-            lit_code(&mut bits, data[pos]);
-            if pos + MIN_MATCH <= n {
-                let h = hash3(data, pos);
-                prev[pos] = head[h];
-                head[h] = pos;
-            }
+            out.push(Tok::Lit(data[pos]));
+            insert(data, &mut head, &mut prev, pos);
             pos += 1;
         }
     }
+    out
+}
 
-    // End of block.
+/// Length-limited Huffman code lengths by package-merge: optimal under `limit`.
+fn huff_lengths(freq: &[u32], limit: usize) -> Vec<u8> {
+    let n = freq.len();
+    let mut lengths = vec![0u8; n];
+    let mut items: Vec<(u64, Vec<usize>)> = Vec::new();
+    for (i, f) in freq.iter().enumerate() {
+        if *f > 0 {
+            items.push((*f as u64, vec![i]));
+        }
+    }
+    if items.is_empty() {
+        return lengths;
+    }
+    if items.len() == 1 {
+        // One code alone has no length; deflate needs a tree, so give it a
+        // partner that simply never appears in the data.
+        let only = items[0].1[0];
+        lengths[only] = 1;
+        lengths[if only == 0 { 1 } else { 0 }] = 1;
+        return lengths;
+    }
+    items.sort_by_key(|x| x.0);
+    let mut lists: Vec<Vec<(u64, Vec<usize>)>> = Vec::with_capacity(limit);
+    lists.push(items.clone());
+    for _ in 1..limit {
+        let prev = lists.last().unwrap().clone();
+        let mut merged: Vec<(u64, Vec<usize>)> = items.clone();
+        let mut i = 0;
+        while i + 1 < prev.len() {
+            let mut syms = prev[i].1.clone();
+            syms.extend_from_slice(&prev[i + 1].1);
+            merged.push((prev[i].0 + prev[i + 1].0, syms));
+            i += 2;
+        }
+        merged.sort_by_key(|x| x.0);
+        lists.push(merged);
+    }
+    let mut counts = vec![0u32; n];
+    let take = 2 * items.len() - 2;
+    for (_, syms) in lists.last().unwrap().iter().take(take) {
+        for s in syms {
+            counts[*s] += 1;
+        }
+    }
+    for i in 0..n {
+        lengths[i] = counts[i].min(limit as u32) as u8;
+    }
+    lengths
+}
+
+/// Canonical Huffman codes for the given lengths, in deflate's bit order.
+fn canonical_codes(lengths: &[u8]) -> Vec<u16> {
+    let mut bl_count = [0u16; 16];
+    for l in lengths {
+        if *l > 0 {
+            bl_count[*l as usize] += 1;
+        }
+    }
+    let mut next_code = [0u16; 16];
+    let mut code = 0u16;
+    for bits in 1..16 {
+        code = (code + bl_count[bits - 1]) << 1;
+        next_code[bits] = code;
+    }
+    let mut codes = vec![0u16; lengths.len()];
+    for (i, l) in lengths.iter().enumerate() {
+        if *l > 0 {
+            codes[i] = next_code[*l as usize];
+            next_code[*l as usize] += 1;
+        }
+    }
+    codes
+}
+
+/// Run-length encode a code-length sequence with symbols 16, 17 and 18.
+fn rle_lengths(seq: &[u8]) -> (Vec<(u8, u8, u16)>, [u32; 19]) {
+    let mut out: Vec<(u8, u8, u16)> = Vec::new();
+    let mut freq = [0u32; 19];
+    let mut i = 0usize;
+    while i < seq.len() {
+        let v = seq[i];
+        let mut run = 1usize;
+        while i + run < seq.len() && seq[i + run] == v {
+            run += 1;
+        }
+        i += run;
+        if v == 0 {
+            let mut left = run;
+            while left >= 11 {
+                let take = left.min(138);
+                out.push((18, 7, (take - 11) as u16));
+                freq[18] += 1;
+                left -= take;
+            }
+            if left >= 3 {
+                let take = left.min(10);
+                out.push((17, 3, (take - 3) as u16));
+                freq[17] += 1;
+                left -= take;
+            }
+            while left > 0 {
+                out.push((0, 0, 0));
+                freq[0] += 1;
+                left -= 1;
+            }
+        } else {
+            out.push((v, 0, 0));
+            freq[v as usize] += 1;
+            let mut left = run - 1;
+            while left >= 3 {
+                let take = left.min(6);
+                out.push((16, 2, (take - 3) as u16));
+                freq[16] += 1;
+                left -= take;
+            }
+            while left > 0 {
+                out.push((v, 0, 0));
+                freq[v as usize] += 1;
+                left -= 1;
+            }
+        }
+    }
+    (out, freq)
+}
+
+/// One block with fixed Huffman tables: no header, so best for tiny blocks.
+fn emit_fixed(bits: &mut BitOut, toks: &[Tok], last: bool) {
+    bits.put(if last { 1 } else { 0 }, 1);
+    bits.put(1, 2);
+    for tok in toks {
+        match *tok {
+            Tok::Lit(b) => fixed_lit_code(bits, b),
+            Tok::Match { len, dist } => {
+                let (idx, extra) = find_length(len as usize);
+                fixed_length_code(bits, 257 + idx as u32);
+                if LEN_EXTRA[idx] > 0 {
+                    bits.put(extra, LEN_EXTRA[idx] as u32);
+                }
+                let (didx, dextra) = find_distance(dist as usize);
+                bits.put_code(didx as u32, 5);
+                if DIST_EXTRA[didx] > 0 {
+                    bits.put(dextra, DIST_EXTRA[didx] as u32);
+                }
+            }
+        }
+    }
     bits.put_code(0, 7);
+}
+
+/// One block with its own literal/length and distance tables.
+fn emit_dynamic(bits: &mut BitOut, toks: &[Tok], last: bool) {
+    let mut lit_freq = [0u32; 286];
+    let mut dist_freq = [0u32; 30];
+    for tok in toks {
+        match *tok {
+            Tok::Lit(b) => lit_freq[b as usize] += 1,
+            Tok::Match { len, dist } => {
+                let (idx, _) = find_length(len as usize);
+                lit_freq[257 + idx] += 1;
+                let (didx, _) = find_distance(dist as usize);
+                dist_freq[didx] += 1;
+            }
+        }
+    }
+    lit_freq[256] += 1; // end of block
+
+    let lit_len = huff_lengths(&lit_freq, MAX_BITS);
+    let mut dist_len = huff_lengths(&dist_freq, MAX_BITS);
+    if dist_len.iter().all(|l| *l == 0) {
+        // No matches at all: deflate still wants one distance code.
+        dist_len[0] = 1;
+    }
+    let lit_codes = canonical_codes(&lit_len);
+    let dist_codes = canonical_codes(&dist_len);
+
+    // Trim trailing zero lengths; the header names how many codes follow.
+    let mut hlit = 286usize;
+    while hlit > 257 && lit_len[hlit - 1] == 0 {
+        hlit -= 1;
+    }
+    let mut hdist = 30usize;
+    while hdist > 1 && dist_len[hdist - 1] == 0 {
+        hdist -= 1;
+    }
+    let mut seq: Vec<u8> = Vec::with_capacity(hlit + hdist);
+    seq.extend_from_slice(&lit_len[..hlit]);
+    seq.extend_from_slice(&dist_len[..hdist]);
+    let (rle, cl_freq) = rle_lengths(&seq);
+    let cl_len = huff_lengths(&cl_freq, MAX_CL_BITS);
+    let cl_codes = canonical_codes(&cl_len);
+    let mut hclen = 19usize;
+    while hclen > 4 && cl_len[CL_ORDER[hclen - 1]] == 0 {
+        hclen -= 1;
+    }
+
+    bits.put(if last { 1 } else { 0 }, 1);
+    bits.put(2, 2); // BTYPE = 10, dynamic Huffman
+    bits.put((hlit - 257) as u32, 5);
+    bits.put((hdist - 1) as u32, 5);
+    bits.put((hclen - 4) as u32, 4);
+    for i in 0..hclen {
+        bits.put(cl_len[CL_ORDER[i]] as u32, 3);
+    }
+    for (sym, nbits, value) in &rle {
+        bits.put_code(cl_codes[*sym as usize] as u32, cl_len[*sym as usize] as u32);
+        if *nbits > 0 {
+            bits.put(*value as u32, *nbits as u32);
+        }
+    }
+
+    for tok in toks {
+        match *tok {
+            Tok::Lit(b) => bits.put_code(lit_codes[b as usize] as u32, lit_len[b as usize] as u32),
+            Tok::Match { len, dist } => {
+                let (idx, extra) = find_length(len as usize);
+                let symbol = 257 + idx;
+                bits.put_code(lit_codes[symbol] as u32, lit_len[symbol] as u32);
+                if LEN_EXTRA[idx] > 0 {
+                    bits.put(extra, LEN_EXTRA[idx] as u32);
+                }
+                let (didx, dextra) = find_distance(dist as usize);
+                bits.put_code(dist_codes[didx] as u32, dist_len[didx] as u32);
+                if DIST_EXTRA[didx] > 0 {
+                    bits.put(dextra, DIST_EXTRA[didx] as u32);
+                }
+            }
+        }
+    }
+    bits.put_code(lit_codes[256] as u32, lit_len[256] as u32);
+}
+
+/// Raw deflate: LZ77 with lazy matching, then blocks with their own tables.
+pub fn deflate(data: &[u8]) -> Vec<u8> {
+    let toks = lz77(data);
+    let mut bits = BitOut::new();
+    if toks.is_empty() {
+        emit_fixed(&mut bits, &[], true);
+        return bits.finish();
+    }
+    let mut at = 0usize;
+    while at < toks.len() {
+        let end = (at + BLOCK_TOKENS).min(toks.len());
+        let last = end == toks.len();
+        let block = &toks[at..end];
+        if block.len() < 64 {
+            emit_fixed(&mut bits, block, last);
+        } else {
+            emit_dynamic(&mut bits, block, last);
+        }
+        at = end;
+    }
     bits.finish()
 }
 
@@ -256,6 +549,12 @@ mod tests {
             far[i] = (i % 251) as u8;
         }
         roundtrip(&far);
+        // Enough distinct text to force several dynamic blocks.
+        let mut big = Vec::new();
+        for i in 0..40_000 {
+            big.extend_from_slice(format!("<li id=\"{}\">row {} of the table</li>\n", i, i).as_bytes());
+        }
+        roundtrip(&big);
     }
 
     #[test]
@@ -284,5 +583,39 @@ mod tests {
             packed.len()
         );
         roundtrip(text.as_bytes());
+    }
+
+    #[test]
+    fn a_real_page_compresses_better_than_fixed_tables_would() {
+        // A page of ordinary HTML: lowercase, spaces, short tags. Fixed Huffman
+        // spends 8 bits on every one of those bytes, so a good table must do
+        // clearly better than 55% of the original.
+        let mut page = String::new();
+        for i in 0..200 {
+            page.push_str(&format!(
+                "<section class=\"card\"><h2>Item {}</h2><p>Some ordinary sentence about it.</p></section>\n",
+                i
+            ));
+        }
+        let packed = gzip(page.as_bytes());
+        let ratio = packed.len() as f64 / page.len() as f64;
+        assert!(ratio < 0.30, "ratio {:.3} is not good enough", ratio);
+        roundtrip(page.as_bytes());
+    }
+
+    #[test]
+    fn lengths_are_optimal_under_the_limit() {
+        // Every code must fit in 15 bits and the code must be complete.
+        let mut freq = vec![1u32; 286];
+        freq[0] = 100_000;
+        freq[1] = 50_000;
+        let lengths = huff_lengths(&freq, MAX_BITS);
+        assert!(lengths.iter().all(|l| *l as usize <= MAX_BITS));
+        let kraft: f64 = lengths
+            .iter()
+            .filter(|l| **l > 0)
+            .map(|l| 2f64.powi(-(*l as i32)))
+            .sum();
+        assert!((kraft - 1.0).abs() < 1e-9, "kraft {}", kraft);
     }
 }

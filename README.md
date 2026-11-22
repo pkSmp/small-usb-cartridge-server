@@ -28,6 +28,7 @@ keeps serving. Web server, import, art and status are all one
 | **Cluster mode** | Several boxes on the same switch act as one: each broadcasts what it serves and how busy it is, copies a new release from a peer within seconds, and takes the load off a node that already has a connection per core - relayed with `splice(2)`, so the bytes never leave the kernel. |
 | **The network on one page** | Every box writes `/srv/cartridge/netmap.txt`: plain text, uncompressed, the same bytes on every machine. It lists each computer with its auto-generated name, address, epoch, load and GPU presence, every file the cartridge carried, and which computers hold each chunk. Because it is rendered from the beacon list and the ownership plan, it needs no controller and no shared writable file. |
 | **A zip you can open anywhere** | `cartridge fleet zip` writes `network-<epoch>.zip`: the network map, the blueprint and every site file, stored rather than deflated. The solid `.cart` archive stays the small one; the zip is the one a person can hand to someone else. |
+| **The smallest backup it can be** | `archive/<epoch>.cart` is one solid deflate stream over every distinct chunk, and its index carries no hashes at all: a restore recomputes them from the bytes and checks the release root. A 300-page site of 142.5 KB becomes a 6.4 KB file; the live release of 13.6 KB becomes 4.0 KB. |
 | **Live status screen** | Under the art: the Markdown site table, the machine and staging facts, and the newest import and boot messages as plain text, redrawn four times a second so a line appears as it is logged. Big text uses the brightest colour from the art; small labels use a reserved bright red so they stay readable, falling back to a saturated red or green from the art when no palette slot is free. Storage reports the internal filesystem's actual used and free space, so the OS, the server binary and every installed program are included; the removable cartridge is never counted. |
 
 ## Setup (5 minutes)
@@ -225,6 +226,32 @@ machines is a valid check that they agree — and no file has to be shared or
 written by a controller. A box that was off for a week catches up by rendering it
 again. `cartridge fleet map` prints the summary and the path; on a single machine
 with no daemon running it writes the one-box version first.
+
+### The archive, and why it is this small
+
+`archive/<epoch>.cart` is the last line of defence: one file that any survivor
+can read, holding every distinct chunk once, concatenated and deflated as a
+single solid stream so a page repeated across files is paid for once.
+
+What is inside is chosen for size:
+
+- **No hashes in the index.** A text blueprint spends 64 characters of hex on
+every chunk, and hex is random, so it never compresses — on a 300-file site it
+was 93% of the archive. The index stores chunk lengths and the file tree; a
+restore recomputes every hash from the bytes it just inflated.
+- **The root instead.** Those recomputed hashes rebuild the release root, which
+the header carries, so the whole tree is verified against 64 characters of hex.
+A damaged archive is refused whole rather than half-restored.
+- **The index and the network map are deflated too**, because paths and content
+types repeat.
+
+Measured on this box: 300 generated pages (142.5 KB) went from a 64,038-byte file
+to **6,472 bytes**; the live release (13.6 KB, 5 chunks) went from 5,398 bytes to
+**4,011 bytes** and restored file for file. The remaining bytes are the deflated
+pages (4.1 KB of the 6.4 KB) — there is no index left to squeeze.
+
+`CARTARC 1` (text blueprint, per-chunk hex) and `CARTARC 2` (binary index with
+hashes) are still read, so an archive written by an older build restores here.
 
 ### The zip backup
 
