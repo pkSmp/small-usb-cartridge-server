@@ -29,6 +29,11 @@ const REVALIDATE: Duration = Duration::from_millis(1000);
 const DATE_LEN: usize = 29;
 /// Stop a pathological site from growing one worker's cache without bound.
 const CACHE_ENTRIES: usize = 8192;
+/// ...and stop it by bytes as well as by count. 8192 entries of a 256 KiB body
+/// would be 2 GB in one worker, on a box that already holds the whole site in
+/// tmpfs: two copies of every small file, per core, is how a quiet server ends
+/// up swapping while it is supposed to be answering requests.
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Connections one address may hold in one worker. A single host opening
 /// thousands of sockets must not be able to take the whole worker's budget.
 const PER_IP_LIMIT: u32 = 256;
@@ -293,6 +298,23 @@ struct Cached {
     buf: Vec<u8>,
     ctype: String,
     gz: Option<Box<Cached>>,
+}
+
+/// Is this worker's cache holding more bytes than it should? Walks the entries
+/// and stops at the first one over the line, so the common small cache costs a
+/// few adds.
+fn over_budget(cache: &HashMap<String, Cached>) -> bool {
+    if cache.len() < 256 {
+        return false;
+    }
+    let mut total = 0usize;
+    for c in cache.values() {
+        total += c.buf.len() + c.gz.as_ref().map(|g| g.buf.len()).unwrap_or(0);
+        if total >= CACHE_BYTES {
+            return true;
+        }
+    }
+    false
 }
 
 fn head_start(code: u16, ctype: &str, length: u64, gz: bool) -> (Vec<u8>, usize) {
@@ -1116,7 +1138,7 @@ fn handle_request(
     };
 
     if let Some((key, c)) = entry {
-        if cache.len() >= CACHE_ENTRIES {
+        if cache.len() >= CACHE_ENTRIES || over_budget(cache) {
             cache.clear();
         }
         cache.insert(key, c);
@@ -1144,7 +1166,7 @@ fn deliver_error(
     head_only: bool,
     clock: &mut Clock,
 ) -> bool {
-    if cache.len() >= CACHE_ENTRIES {
+    if cache.len() >= CACHE_ENTRIES || over_budget(cache) {
         cache.clear();
     }
     cache.insert(decoded.clone(), Cached::error(code));
