@@ -248,6 +248,12 @@ pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 /// Decompress with an explicit output cap. The cap is checked as the output
 /// grows, so a 10 KB bomb that expands to 10 GB stops at the cap.
 pub fn zlib_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+    // The card decodes it when there is one, and checks the stream's own
+    // Adler-32 before saying so. A refusal (bad stream, no card, no memory)
+    // falls through to the CPU, which is also what reports the error.
+    if let Some(out) = crate::offload::gunzip_bulk(data, limit, true) {
+        return Ok(out);
+    }
     if data.len() < 2 {
         return Err("zlib: too short".into());
     }
@@ -274,6 +280,11 @@ pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Decompress a gzip stream with an explicit output cap.
 pub fn gzip_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+    // The card decodes it when there is one, checking each member's CRC-32 and
+    // length as it goes; only a refusal comes back here.
+    if let Some(out) = crate::offload::gunzip_bulk(data, limit, false) {
+        return Ok(out);
+    }
     if data.len() < 18 || data[0] != 0x1F || data[1] != 0x8B {
         return Err("gzip: bad magic".into());
     }

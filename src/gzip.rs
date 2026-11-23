@@ -606,8 +606,36 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// A complete gzip member.
+/// A complete gzip file. The card encodes it when there is one; a release is
+/// written as one member per slice, and every reader concatenates members.
 pub fn gzip(data: &[u8]) -> Vec<u8> {
+    if let Some(out) = gzip_card(data) {
+        return out;
+    }
+    gzip_cpu(data)
+}
+
+/// One member per slice, encoded on the card. `None` when there is no card, it
+/// refuses a slice, or its own decoder does not give the bytes back.
+fn gzip_card(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < CARD_SLICE_MIN || !crate::offload::has_card() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() / 3 + 64);
+    let mut at = 0usize;
+    while at < data.len() {
+        let mut end = (at + SLICE).min(data.len());
+        if data.len() - end < CARD_SLICE_MIN {
+            end = data.len();
+        }
+        out.extend_from_slice(&crate::offload::gzip_bulk(&data[at..end])?);
+        at = end;
+    }
+    Some(out)
+}
+
+/// A complete gzip member on the CPU.
+pub fn gzip_cpu(data: &[u8]) -> Vec<u8> {
     let body = deflate(data);
     let mut out = Vec::with_capacity(body.len() + 18);
     out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03]);

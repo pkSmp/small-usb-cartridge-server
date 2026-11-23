@@ -330,7 +330,9 @@ than that on its own, so a static file server has nothing to hand a card. The
 CPU is left with three jobs and no others: booting, loading the sites, and
 serving them. Every other task in the program runs on the card when one is
 present - not only the tasks where the card is the faster engine, and not only
-the ones that already had a kernel.
+the ones that already had a kernel. Where an algorithm is sequential, the card
+runs it as a one-work-item program: the graphics card is used as a small, slow
+CPU, because these jobs run once a month and the CPU is answering requests.
 
 - `offload.rs` opens `libOpenCL.so.1` with `dlopen` (no crates), finds a GPU
 device, and **measures every task against the CPU on this machine**. The table is
@@ -372,10 +374,19 @@ device, and **measures every task against the CPU on this machine**. The table i
   against the bytes before it is emitted, so a wrong answer from the driver costs
   a slice, never a corrupt archive. A release is searched in 4 MiB slices, which
   bounds the chain table at 32 MB whatever the size of the release.
-- What is left on the CPU besides booting, loading and serving: decoding a
-  compressed stream (`inflate` is a sequential bitstream - where one symbol
-  starts depends on where the one before it ended), the O(n) token walk over the
-  card's matches, the filesystem calls themselves, and the plan's ranking
+- gzip itself runs on the card in both directions (`src/gzip_kernel.cl`): one
+  work-item runs the whole encoder or decoder, because a Huffman code is a
+  bitstream and where one symbol starts depends on where the one before it
+  ended, so it cannot be spread over work-items. Decoding checks every member's
+  own CRC-32 and length inside the kernel, so a decode mistake cannot pass for a
+  success; encoding is checked by decoding the result on the card and comparing
+  bytes before it is used, so a wrong kernel costs the CPU path and never a
+  broken archive. A release is encoded as one member per 4 MiB slice, which is
+  legal gzip and keeps the chain table at 32 MB. The CPU's own encoder and
+  decoder are still in the tree and are what runs when there is no card.
+- What is left on the CPU besides booting, loading and serving: the filesystem
+  calls themselves, the daemon's own bookkeeping (parsing and formatting its
+  state, which lives in Rust memory the card cannot see), and the plan's ranking
   (`weight / -ln(u)`), which has to come out bit-identical on every box or two
   computers hold different replicas; one card's `log()` is not promised to agree
   with another's.

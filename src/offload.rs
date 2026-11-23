@@ -127,6 +127,11 @@ __kernel void sha256(__global const uchar *data, uint len, __global uchar *out) 
 }
 "#;
 
+/// gzip in both directions, as one-work-item programs. The whole sequential
+/// algorithm runs on the card; see the file for why that is the only way to put
+/// a Huffman bitstream anywhere but the CPU.
+const GZIP_SRC: &str = include_str!("gzip_kernel.cl");
+
 /// The LZ77 match search: one work-item per position, walking the same hash
 /// chain `gzip::longest` walks, so the tokens come out the same.
 const LZ77_SRC: &str = r#"
@@ -333,6 +338,8 @@ struct Gpu {
     fit: OnceLock<Option<Kernel>>,
     tiles: OnceLock<Option<Kernel>>,
     lz77: OnceLock<Option<Kernel>>,
+    gz: OnceLock<Option<Kernel>>,
+    gun: OnceLock<Option<Kernel>>,
     /// A command queue is not safe for concurrent enqueues, so every dispatch
     /// takes this. Bulk work is rare; serialising it costs nothing.
     lock: std::sync::Mutex<()>,
@@ -555,6 +562,192 @@ impl Gpu {
             std::ptr::null(),
             std::ptr::null_mut(),
         ) != 0
+        {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// One gzip member, encoded by the card: header, deflate, CRC and length.
+    fn gz_encode(&self, data: &[u8]) -> Option<Vec<u8>> {
+        if data.is_empty() || data.len() > u32::MAX as usize / 8 {
+            return None;
+        }
+        let cap = data.len() + data.len() / 8 + 4096;
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let kernel = self.kernel(GZIP_SRC, "gzip", &self.gz)?;
+        let f = &self.fns;
+        let mut err = 0i32;
+        let input = (f.create_buffer)(
+            self.context,
+            MEM_READ_ONLY | MEM_COPY_HOST,
+            data.len(),
+            data.as_ptr() as *mut c_void,
+            &mut err,
+        );
+        let output = (f.create_buffer)(self.context, MEM_WRITE_ONLY, cap, std::ptr::null_mut(), &mut err);
+        let toks = (f.create_buffer)(self.context, 0, (data.len() + 16) * 4, std::ptr::null_mut(), &mut err);
+        let head = (f.create_buffer)(self.context, 0, 65536 * 4, std::ptr::null_mut(), &mut err);
+        let prev = (f.create_buffer)(self.context, 0, 32768 * 4, std::ptr::null_mut(), &mut err);
+        let res = (f.create_buffer)(self.context, MEM_WRITE_ONLY, 8, std::ptr::null_mut(), &mut err);
+        let _bufs = Buffers { gpu: self, mem: vec![input, output, toks, head, prev, res] };
+        if input.is_null() || output.is_null() || toks.is_null() || head.is_null() || prev.is_null() || res.is_null() {
+            return None;
+        }
+        let n32 = data.len() as u32;
+        let cap32 = cap as u32;
+        (f.set_arg)(kernel, 0, std::mem::size_of::<Mem>(), &input as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 1, 4, &n32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 2, std::mem::size_of::<Mem>(), &output as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 3, 4, &cap32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 4, std::mem::size_of::<Mem>(), &toks as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 5, std::mem::size_of::<Mem>(), &head as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 6, std::mem::size_of::<Mem>(), &prev as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 7, std::mem::size_of::<Mem>(), &res as *const Mem as *const c_void);
+        let global = [1usize];
+        if (f.enqueue)(
+            self.queue,
+            kernel,
+            1,
+            std::ptr::null(),
+            global.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        (f.finish)(self.queue);
+        let mut got = [0u32; 2];
+        if (f.read_buffer)(
+            self.queue,
+            res,
+            1,
+            0,
+            8,
+            got.as_mut_ptr() as *mut c_void,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        if got[0] != 0 {
+            note(&format!("offload: the card's gzip refused this slice ({})", got[0]));
+            return None;
+        }
+        let len = got[1] as usize;
+        if len == 0 || len > cap {
+            return None;
+        }
+        let mut out = vec![0u8; len];
+        if (f.read_buffer)(
+            self.queue,
+            output,
+            1,
+            0,
+            len,
+            out.as_mut_ptr() as *mut c_void,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// A whole gzip file (or a zlib stream) decoded by the card. The kernel
+    /// checks the member's own CRC and length, so a successful return is proof
+    /// the bytes are the ones the stream specifies.
+    fn gz_decode(&self, data: &[u8], cap: usize, zlib: bool) -> Option<Vec<u8>> {
+        if data.is_empty() || cap == 0 || cap > u32::MAX as usize {
+            return None;
+        }
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let kernel = self.kernel(GZIP_SRC, "gunzip", &self.gun)?;
+        let f = &self.fns;
+        let mut err = 0i32;
+        let input = (f.create_buffer)(
+            self.context,
+            MEM_READ_ONLY | MEM_COPY_HOST,
+            data.len(),
+            data.as_ptr() as *mut c_void,
+            &mut err,
+        );
+        let output = (f.create_buffer)(self.context, MEM_WRITE_ONLY, cap, std::ptr::null_mut(), &mut err);
+        let res = (f.create_buffer)(self.context, MEM_WRITE_ONLY, 8, std::ptr::null_mut(), &mut err);
+        let _bufs = Buffers { gpu: self, mem: vec![input, output, res] };
+        if input.is_null() || output.is_null() || res.is_null() {
+            return None;
+        }
+        let n32 = data.len() as u32;
+        let cap32 = cap as u32;
+        let z = if zlib { 1u32 } else { 0u32 };
+        (f.set_arg)(kernel, 0, std::mem::size_of::<Mem>(), &input as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 1, 4, &n32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 2, std::mem::size_of::<Mem>(), &output as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 3, 4, &cap32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 4, 4, &z as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 5, std::mem::size_of::<Mem>(), &res as *const Mem as *const c_void);
+        let global = [1usize];
+        if (f.enqueue)(
+            self.queue,
+            kernel,
+            1,
+            std::ptr::null(),
+            global.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        (f.finish)(self.queue);
+        let mut got = [0u32; 2];
+        if (f.read_buffer)(
+            self.queue,
+            res,
+            1,
+            0,
+            8,
+            got.as_mut_ptr() as *mut c_void,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        if got[0] != 0 {
+            // Not an error to log: an invalid stream is the caller's problem and
+            // the CPU decoder reports it with a message. This is only "the card
+            // will not do this one".
+            return None;
+        }
+        let len = got[1] as usize;
+        if len > cap {
+            return None;
+        }
+        let mut out = vec![0u8; len];
+        if len > 0
+            && (f.read_buffer)(
+                self.queue,
+                output,
+                1,
+                0,
+                len,
+                out.as_mut_ptr() as *mut c_void,
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ) != 0
         {
             return None;
         }
@@ -991,6 +1184,8 @@ fn open() -> Option<Gpu> {
             fit: OnceLock::new(),
             tiles: OnceLock::new(),
             lz77: OnceLock::new(),
+            gz: OnceLock::new(),
+            gun: OnceLock::new(),
             lock: std::sync::Mutex::new(()),
         })
     }
@@ -1267,6 +1462,26 @@ fn nearest_ready() -> bool {
 /// Is there a card to hand work to?
 pub fn has_card() -> bool {
     gpu().is_some()
+}
+
+/// A whole gzip member encoded on the card. `None` means the CPU does it.
+pub fn gzip_bulk(data: &[u8]) -> Option<Vec<u8>> {
+    let g = gpu()?;
+    let out = g.gz_encode(data)?;
+    // The encoder has no checksum of its own to lean on, so the card's own
+    // decoder has to give the bytes back before this stream is trusted. A wrong
+    // encoder costs the CPU path, never a broken archive.
+    let back = g.gz_decode(&out, data.len(), false)?;
+    if back.as_slice() != data {
+        note("offload: the card's gzip did not round-trip; this run encodes on the CPU");
+        return None;
+    }
+    Some(out)
+}
+
+/// A whole gzip file (or zlib stream) decoded on the card.
+pub fn gunzip_bulk(data: &[u8], cap: usize, zlib: bool) -> Option<Vec<u8>> {
+    gpu()?.gz_decode(data, cap, zlib)
 }
 
 /// The LZ77 match search for one slice, on the card. `None` means the caller
