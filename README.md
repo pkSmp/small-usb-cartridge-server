@@ -328,8 +328,9 @@ Nothing on the request path. A request costs about 10 us of CPU - `epoll`,
 `read`, a path lookup, `write` and `sendfile` - and one GPU dispatch costs more
 than that on its own, so a static file server has nothing to hand a card. The
 CPU is left with three jobs and no others: booting, loading the sites, and
-serving them. Every other task the server has that a card can execute runs on
-the card whenever one is present.
+serving them. Every other task in the program runs on the card when one is
+present - not only the tasks where the card is the faster engine, and not only
+the ones that already had a kernel.
 
 - `offload.rs` opens `libOpenCL.so.1` with `dlopen` (no crates), finds a GPU
 device, and **measures every task against the CPU on this machine**. The table is
@@ -363,6 +364,21 @@ device, and **measures every task against the CPU on this machine**. The table i
   draw. Both keep the CPU's exact u64 arithmetic and are compared with the CPU's
   own loop byte for byte before the card is trusted, so `art build` writes the
   same `art.bin` and `art verify` reports the same dots whichever engine ran.
+- The LZ77 search inside `deflate` - the half of compression that actually
+  costs time - is a kernel too. `gzip` builds the hash chain in one linear pass
+  with no comparisons (`link_table`), hands the chain and the slice to the card,
+  and gets `len << 16 | dist` back for every position; the CPU only walks the
+  tokens and applies lazy matching. Every match the card returns is compared
+  against the bytes before it is emitted, so a wrong answer from the driver costs
+  a slice, never a corrupt archive. A release is searched in 4 MiB slices, which
+  bounds the chain table at 32 MB whatever the size of the release.
+- What is left on the CPU besides booting, loading and serving: decoding a
+  compressed stream (`inflate` is a sequential bitstream - where one symbol
+  starts depends on where the one before it ended), the O(n) token walk over the
+  card's matches, the filesystem calls themselves, and the plan's ranking
+  (`weight / -ln(u)`), which has to come out bit-identical on every box or two
+  computers hold different replicas; one card's `log()` is not promised to agree
+  with another's.
 - The console's text stays on the CPU, and the table says why: a status frame is
   a couple of kilobytes of escape codes once a second, and one dispatch round
   trip costs more than the whole frame. `cartridge gpu` prints that dispatch

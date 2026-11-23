@@ -17,7 +17,9 @@
 //!     letter; a real table costs about 4-5 on text.
 //!   * **A window-sized chain array.** Candidate links live in a ring of
 //!     `WINDOW` entries rather than one entry per input byte, so a 300 MB
-//!     release no longer needs gigabytes to compress.
+//!     release no longer needs gigabytes to compress. When a card is present
+//!     the search over those links runs there instead, a slice at a time, and
+//!     every match it returns is checked against the bytes before use.
 //!
 //! Blocks are flushed every 128K tokens: each one gets fresh tables, which
 //! bounds memory and lets a block that is unlike its neighbours use its own
@@ -33,6 +35,13 @@ const MIN_MATCH: usize = 3;
 const HASH_BITS: usize = 16;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const MAX_CHAIN: usize = 128;
+/// How much input one card dispatch searches: a release is cut into slices of
+/// this size, which bounds the link table and the match buffer at 8 bytes a
+/// byte instead of holding them for a whole release.
+const SLICE: usize = 4 * 1024 * 1024;
+/// Below this many bytes a dispatch costs more than the search, so the CPU does
+/// it; it matches the floor `offload` applies to every bulk task.
+const CARD_SLICE_MIN: usize = 256 * 1024;
 /// Tokens per block: bounds the token list and the cost of one bad table.
 const BLOCK_TOKENS: usize = 1 << 17;
 /// Deflate's limit for literal/length and distance codes.
@@ -202,8 +211,98 @@ fn insert(data: &[u8], head: &mut [usize], prev: &mut [usize], pos: usize) {
     head[h] = pos;
 }
 
-/// The LZ77 pass: literals and matches, with one step of lazy matching.
+/// The chain for every position, in one pass and with no comparisons: filling
+/// the links is cheap, walking them is the expensive half of LZ77.
+fn link_table(data: &[u8]) -> Vec<u32> {
+    let mut head = vec![u32::MAX; HASH_SIZE];
+    let mut link = vec![u32::MAX; data.len()];
+    for pos in 0..data.len() {
+        if pos + MIN_MATCH > data.len() {
+            break;
+        }
+        let h = hash3(data, pos);
+        link[pos] = head[h];
+        head[h] = pos as u32;
+    }
+    link
+}
+
+/// Turn precomputed matches into tokens with the same lazy rule the CPU walk
+/// uses. `None` when a match does not hold up against the bytes, which is the
+/// only way the card can be wrong: the caller then does the slice itself.
+fn walk(data: &[u8], matches: &[u32]) -> Option<Vec<Tok>> {
+    if matches.len() != data.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() / 2 + 1);
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let packed = matches[pos] as usize;
+        let (len, dist) = (packed >> 16, packed & 0xffff);
+        if len >= MIN_MATCH && dist >= 1 && dist <= pos && len <= data.len() - pos {
+            // Verify the match against the bytes before emitting it. This costs
+            // one pass over the token's own length, which is nothing beside the
+            // chain search it replaces, and it means a wrong answer from the
+            // card can never reach a compressed stream.
+            if data[pos - dist..pos - dist + len] != data[pos..pos + len] {
+                return None;
+            }
+            if pos + 1 < data.len() {
+                let next_len = (matches[pos + 1] as usize) >> 16;
+                if next_len > len {
+                    out.push(Tok::Lit(data[pos]));
+                    pos += 1;
+                    continue;
+                }
+            }
+            out.push(Tok::Match { len: len as u16, dist: dist as u16 });
+            pos += len;
+        } else {
+            out.push(Tok::Lit(data[pos]));
+            pos += 1;
+        }
+    }
+    Some(out)
+}
+
+/// The LZ77 pass: the card searches the chains when there is one, the CPU
+/// otherwise. Both produce a valid stream; where the CPU's ring aliases past
+/// the window the card stops instead, so a few matches can differ.
 fn lz77(data: &[u8]) -> Vec<Tok> {
+    if let Some(toks) = lz77_card(data) {
+        return toks;
+    }
+    lz77_cpu(data)
+}
+
+/// Search the chains on the card, one slice at a time so a release of any size
+/// fits in device memory. `None` when there is no card, or it refuses a slice.
+fn lz77_card(data: &[u8]) -> Option<Vec<Tok>> {
+    if data.len() < CARD_SLICE_MIN || !crate::offload::has_card() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() / 2 + 1);
+    let mut at = 0usize;
+    while at < data.len() {
+        let mut end = (at + SLICE).min(data.len());
+        // A dispatch has a floor, so a short tail joins the slice before it
+        // rather than falling back to the CPU and throwing the whole pass away.
+        if data.len() - end < CARD_SLICE_MIN {
+            end = data.len();
+        }
+        let slice = &data[at..end];
+        let link = link_table(slice);
+        let matches =
+            crate::offload::lz77_links(slice, &link, WINDOW as u32, MAX_CHAIN as u32, MAX_MATCH as u32)?;
+        out.extend(walk(slice, &matches)?);
+        at = end;
+    }
+    Some(out)
+}
+
+/// The LZ77 pass on the CPU: literals and matches, with one step of lazy
+/// matching.
+fn lz77_cpu(data: &[u8]) -> Vec<Tok> {
     let mut head = vec![usize::MAX; HASH_SIZE];
     let mut prev = vec![usize::MAX; WINDOW];
     let mut out = Vec::with_capacity(data.len() / 2 + 1);
@@ -613,6 +712,124 @@ mod tests {
         let ratio = packed.len() as f64 / page.len() as f64;
         assert!(ratio < 0.30, "ratio {:.3} is not good enough", ratio);
         roundtrip(page.as_bytes());
+    }
+
+    /// A body of text with the repeats a real page has, big enough for a
+    /// dispatch.
+    fn sample(bytes: usize) -> Vec<u8> {
+        let line = b"<p class=\"note\">The same words, over and over, because a page repeats itself.</p>\n";
+        let mut data = Vec::with_capacity(bytes + line.len());
+        while data.len() < bytes {
+            data.extend_from_slice(line);
+        }
+        data
+    }
+
+    /// The kernel's loop, on the CPU: walk `link` from `pos`, newest first,
+    /// stopping at the window edge, and keep the longest match.
+    fn chain(data: &[u8], link: &[u32], pos: usize) -> (usize, usize) {
+        if pos + MIN_MATCH > data.len() {
+            return (0, 0);
+        }
+        let limit = MAX_MATCH.min(data.len() - pos);
+        let (mut best_len, mut best_dist) = (0usize, 0usize);
+        let mut cand = link[pos];
+        let mut tries = 0usize;
+        while cand != u32::MAX && tries < MAX_CHAIN {
+            let at = cand as usize;
+            if at >= pos || pos - at > WINDOW {
+                break;
+            }
+            let mut len = 0usize;
+            while len < limit && data[at + len] == data[pos + len] {
+                len += 1;
+            }
+            if len > best_len {
+                best_len = len;
+                best_dist = pos - at;
+                if len >= limit {
+                    break;
+                }
+            }
+            cand = link[at];
+            tries += 1;
+        }
+        if best_len < MIN_MATCH {
+            (0, 0)
+        } else {
+            (best_len, best_dist)
+        }
+    }
+
+    #[test]
+    fn the_link_table_holds_what_the_walk_has_in_its_head() {
+        // The one-pass table must record, for every position, exactly the head
+        // the sequential walk would have had at that moment.
+        let data = sample(120_000);
+        let link = link_table(&data);
+        let mut head = vec![u32::MAX; HASH_SIZE];
+        for pos in 0..data.len() {
+            if pos + MIN_MATCH > data.len() {
+                break;
+            }
+            let h = hash3(&data, pos);
+            assert_eq!(link[pos], head[h], "position {}", pos);
+            head[h] = pos as u32;
+        }
+    }
+
+    #[test]
+    fn precomputed_matches_walk_to_the_same_tokens() {
+        // The card returns matches and `walk` turns them into tokens. Fed the
+        // CPU's own matches, it must build exactly the stream `lz77_cpu` builds,
+        // or a card-built archive would differ in ways nobody measured.
+        let data = sample(400_000);
+        let link = link_table(&data);
+        let matches: Vec<u32> = (0..data.len())
+            .map(|pos| {
+                let (len, dist) = chain(&data, &link, pos);
+                if len >= MIN_MATCH {
+                    ((len << 16) | dist) as u32
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let a = walk(&data, &matches).expect("the CPU's own matches must verify");
+        let b = lz77_cpu(&data);
+        assert_eq!(a.len(), b.len(), "token count differs");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            match (x, y) {
+                (Tok::Lit(p), Tok::Lit(q)) => assert_eq!(p, q, "literal {} differs", i),
+                (
+                    Tok::Match { len: l1, dist: d1 },
+                    Tok::Match { len: l2, dist: d2 },
+                ) => assert_eq!((l1, d1), (l2, d2), "match {} differs", i),
+                _ => panic!("token {} is a different kind", i),
+            }
+        }
+    }
+
+    #[test]
+    fn the_card_finds_the_same_matches_as_the_chain() {
+        if !crate::offload::has_card() {
+            return; // no card here: the CPU path is what this box runs
+        }
+        let data = sample(300 * 1024);
+        let link = link_table(&data);
+        let Some(matches) = crate::offload::lz77_links(
+            &data,
+            &link,
+            WINDOW as u32,
+            MAX_CHAIN as u32,
+            MAX_MATCH as u32,
+        ) else {
+            return; // the driver refused the kernel; the CPU keeps the work
+        };
+        for pos in 0..data.len() {
+            let got = ((matches[pos] >> 16) as usize, (matches[pos] & 0xffff) as usize);
+            assert_eq!(got, chain(&data, &link, pos), "position {}", pos);
+        }
     }
 
     #[test]

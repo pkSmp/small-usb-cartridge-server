@@ -127,6 +127,38 @@ __kernel void sha256(__global const uchar *data, uint len, __global uchar *out) 
 }
 "#;
 
+/// The LZ77 match search: one work-item per position, walking the same hash
+/// chain `gzip::longest` walks, so the tokens come out the same.
+const LZ77_SRC: &str = r#"
+__kernel void lz77(__global const uchar *data, uint n,
+                   __global const uint *link,
+                   uint chain, uint max_match, uint window,
+                   __global uint *out) {
+    uint p = get_global_id(0);
+    if (p >= n) return;
+    uint limit = n - p;
+    if (limit > max_match) limit = max_match;
+    uint best_len = 0u, best_dist = 0u;
+    uint cand = link[p];
+    uint tries = 0u;
+    while (cand != 0xFFFFFFFFu && tries < chain) {
+        if (cand >= p) break;
+        uint dist = p - cand;
+        if (dist > window) break;
+        uint len = 0u;
+        while (len < limit && data[cand + len] == data[p + len]) len++;
+        if (len > best_len) {
+            best_len = len;
+            best_dist = dist;
+            if (len >= limit) break;
+        }
+        cand = link[cand];
+        tries++;
+    }
+    out[p] = best_len >= 3u ? ((best_len << 16) | best_dist) : 0u;
+}
+"#;
+
 /// Nearest palette entry per pixel, squared distance, lowest index on a tie:
 /// exactly what `art::nearest` computes, so a caller can swap them freely.
 const NEAREST_SRC: &str = r#"
@@ -282,6 +314,7 @@ struct Fns {
         *const c_void,
         *mut c_void,
     ) -> i32,
+    release_mem: extern "C" fn(Mem) -> i32,
 }
 
 extern "C" fn ctx_cb(_: *const i8, _: *const c_void, _: usize, _: *mut c_void) {}
@@ -299,6 +332,7 @@ struct Gpu {
     near: OnceLock<Option<Kernel>>,
     fit: OnceLock<Option<Kernel>>,
     tiles: OnceLock<Option<Kernel>>,
+    lz77: OnceLock<Option<Kernel>>,
     /// A command queue is not safe for concurrent enqueues, so every dispatch
     /// takes this. Bulk work is rare; serialising it costs nothing.
     lock: std::sync::Mutex<()>,
@@ -308,6 +342,24 @@ struct Gpu {
 // behind `lock`, and the kernel slots are `OnceLock`s, so sharing this across
 // threads is sound.
 unsafe impl Send for Gpu {}
+
+/// Releases the device buffers a dispatch created, on every path out of it.
+/// Without this the driver holds the last dispatch's memory for the life of the
+/// process, and the card now hashes every chunk, so that is not a slow leak.
+struct Buffers<'a> {
+    gpu: &'a Gpu,
+    mem: Vec<Mem>,
+}
+
+impl Drop for Buffers<'_> {
+    fn drop(&mut self) {
+        for m in self.mem.drain(..) {
+            if !m.is_null() {
+                (self.gpu.fns.release_mem)(m);
+            }
+        }
+    }
+}
 unsafe impl Sync for Gpu {}
 
 impl Gpu {
@@ -381,6 +433,7 @@ impl Gpu {
         if input.is_null() || output.is_null() {
             return None;
         }
+        let _bufs = Buffers { gpu: self, mem: vec![input, output] };
         let len32 = len as u32;
         (f.set_arg)(kernel, 0, std::mem::size_of::<Mem>(), &input as *const Mem as *const c_void);
         (f.set_arg)(kernel, 1, 4, &len32 as *const u32 as *const c_void);
@@ -497,6 +550,84 @@ impl Gpu {
             1,
             0,
             out.len(),
+            out.as_mut_ptr() as *mut c_void,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// The LZ77 match search for one slice: `len << 16 | dist` per position.
+    fn lz77_slice(
+        &self,
+        data: &[u8],
+        link: &[u32],
+        window: u32,
+        chain: u32,
+        max_match: u32,
+    ) -> Option<Vec<u32>> {
+        if data.is_empty() || link.len() != data.len() || data.len() > u32::MAX as usize {
+            return None;
+        }
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let kernel = self.kernel(LZ77_SRC, "lz77", &self.lz77)?;
+        let f = &self.fns;
+        let mut err = 0i32;
+        let input = (f.create_buffer)(
+            self.context,
+            MEM_READ_ONLY | MEM_COPY_HOST,
+            data.len(),
+            data.as_ptr() as *mut c_void,
+            &mut err,
+        );
+        let links = (f.create_buffer)(
+            self.context,
+            MEM_READ_ONLY | MEM_COPY_HOST,
+            link.len() * 4,
+            link.as_ptr() as *mut c_void,
+            &mut err,
+        );
+        let out_len = data.len() * 4;
+        let output = (f.create_buffer)(self.context, MEM_WRITE_ONLY, out_len, std::ptr::null_mut(), &mut err);
+        let _bufs = Buffers { gpu: self, mem: vec![input, links, output] };
+        if input.is_null() || links.is_null() || output.is_null() {
+            return None;
+        }
+        let n32 = data.len() as u32;
+        (f.set_arg)(kernel, 0, std::mem::size_of::<Mem>(), &input as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 1, 4, &n32 as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 2, std::mem::size_of::<Mem>(), &links as *const Mem as *const c_void);
+        (f.set_arg)(kernel, 3, 4, &chain as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 4, 4, &max_match as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 5, 4, &window as *const u32 as *const c_void);
+        (f.set_arg)(kernel, 6, std::mem::size_of::<Mem>(), &output as *const Mem as *const c_void);
+        let global = [data.len()];
+        if (f.enqueue)(
+            self.queue,
+            kernel,
+            1,
+            std::ptr::null(),
+            global.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return None;
+        }
+        (f.finish)(self.queue);
+        let mut out = vec![0u32; data.len()];
+        if (f.read_buffer)(
+            self.queue,
+            output,
+            1,
+            0,
+            out_len,
             out.as_mut_ptr() as *mut c_void,
             0,
             std::ptr::null(),
@@ -796,6 +927,8 @@ fn open() -> Option<Gpu> {
             *const c_void,
             *mut c_void,
         ) -> i32 = std::mem::transmute(sym(lib, "clEnqueueReadBuffer"));
+        let release_mem: extern "C" fn(Mem) -> i32 =
+            std::mem::transmute(sym(lib, "clReleaseMemObject"));
 
         let fns = Fns {
             get_platforms,
@@ -812,6 +945,7 @@ fn open() -> Option<Gpu> {
             enqueue,
             finish,
             read_buffer,
+            release_mem,
         };
 
         let mut np: u32 = 0;
@@ -856,6 +990,7 @@ fn open() -> Option<Gpu> {
             near: OnceLock::new(),
             fit: OnceLock::new(),
             tiles: OnceLock::new(),
+            lz77: OnceLock::new(),
             lock: std::sync::Mutex::new(()),
         })
     }
@@ -1128,6 +1263,20 @@ fn nearest_ready() -> bool {
 }
 
 // ---------------------------------------------------------------------- tasks
+
+/// Is there a card to hand work to?
+pub fn has_card() -> bool {
+    gpu().is_some()
+}
+
+/// The LZ77 match search for one slice, on the card. `None` means the caller
+/// searches the slice itself.
+pub fn lz77_links(data: &[u8], link: &[u32], window: u32, chain: u32, max_match: u32) -> Option<Vec<u32>> {
+    if data.len() < MIN_BYTES {
+        return None;
+    }
+    gpu()?.lz77_slice(data, link, window, chain, max_match)
+}
 
 /// Hash a buffer on the card. `None` means the caller hashes it itself: there is
 /// no card, or the buffer is too small to be worth a dispatch.
