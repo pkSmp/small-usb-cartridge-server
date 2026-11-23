@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::raw::{c_int, c_void};
+use std::os::raw::{c_int, c_long, c_void};
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -54,9 +54,27 @@ const STORE: &str = "/srv/cartridge/store";
 const ARCHIVE: &str = "/srv/cartridge/archive";
 const NETMAP: &str = "/srv/cartridge/netmap.txt";
 const LOG_FILE: &str = "/var/log/cartridge/fleet.log";
-/// Two copies of cold data by default, three for the blueprint. Rendezvous
-/// moves only about 1/N of the objects when a node joins or leaves.
+/// The floor: two copies of cold data. Rendezvous moves only about 1/N of the
+/// objects when a node joins or leaves. `replicas_for` raises this whenever the
+/// fleet has room for another full copy, so spare disk is never left idle while
+/// it could be a backup.
 const REPLICAS: usize = 2;
+
+/// How many copies the fleet should hold: the floor above, plus one more for
+/// every full copy the spare space can take, never more than there are boxes.
+///
+/// This is the "extra is always used for redundancy" rule. Every node computes
+/// it from the same plan inputs (the release size and the declared capacity),
+/// so every node reaches the same number and the plan still agrees everywhere.
+fn replicas_for(bp: &Blueprint, members: usize, capacity_mb: &BTreeMap<u64, u64>) -> usize {
+    let members = members.max(1);
+    // Whole megabytes, so two boxes that measure a release a few bytes apart
+    // still agree on how many copies fit.
+    let need_mb = (bp.bytes() / (1024 * 1024)).max(1);
+    let total_mb: u64 = capacity_mb.values().copied().sum();
+    let by_space = 1 + (total_mb.saturating_sub(need_mb) / need_mb) as usize;
+    REPLICAS.max(by_space).min(members)
+}
 
 fn log(tag: &str, message: &str) {
     let line = format!("{}  {:<5} {}\n", sys::fmt_time("%F %T"), tag, message);
@@ -99,6 +117,7 @@ extern "C" {
     fn setsockopt(fd: c_int, level: c_int, name: c_int, value: *const c_void, len: u32) -> c_int;
     fn bind(fd: c_int, addr: *const c_void, len: u32) -> c_int;
     fn close(fd: c_int) -> c_int;
+    fn sysconf(name: c_int) -> c_long;
 }
 
 #[repr(C)]
@@ -300,7 +319,8 @@ impl Node {
                 return plan.clone();
             }
         }
-        let plan = blueprint::assign(&bp, &weights, REPLICAS, &capacity);
+        let copies = replicas_for(&bp, weights.len(), &capacity);
+        let plan = blueprint::assign(&bp, &weights, copies, &capacity);
         *self.plan_cache.lock().unwrap() = Some((stamp, plan.clone()));
         plan
     }
@@ -369,8 +389,12 @@ impl Node {
             Some(b) => crate::json::quote(&b.root),
             None => "null".to_string(),
         };
+        let copies = match &bp {
+            Some(b) => replicas_for(b, self.weights().len(), &self.capacity_mb()),
+            None => REPLICAS,
+        };
         format!(
-            "{{\"id\":\"{:032x}\",\"name\":{},\"epoch\":{},\"ready\":{},\"pending\":{},\"port\":{},\"rps\":{},\"bps\":{},\"weight\":{},\"chunks\":{},\"bytes\":{},\"root\":{},\"peers\":[{}]}}\n",
+            "{{\"id\":\"{:032x}\",\"name\":{},\"epoch\":{},\"ready\":{},\"pending\":{},\"port\":{},\"rps\":{},\"bps\":{},\"weight\":{},\"replicas\":{},\"chunks\":{},\"bytes\":{},\"root\":{},\"peers\":[{}]}}\n",
             self.me.id,
             crate::json::quote(&self.me.name),
             self.my_epoch(),
@@ -380,6 +404,7 @@ impl Node {
             spec.serve_rps,
             spec.serve_bps,
             spec.weight(),
+            copies,
             bp.as_ref().map(|b| b.chunks.len()).unwrap_or(0),
             self.store.bytes(),
             root,
@@ -636,6 +661,11 @@ fn beacon_send(node: Arc<Node>, port: u16) {
     };
     let _ = socket.set_broadcast(true);
     loop {
+        // Advertise the real serving load, and keep it where the idle gate can
+        // see it. This thread already ticks twice a second, so it is the cheap
+        // place to sample.
+        let load = serving_busy();
+        node.busy.store(if load >= 0.25 { 1 } else { 0 }, Ordering::Relaxed);
         let line = node.beacon_line();
         let _ = socket.send_to(line.as_bytes(), ("255.255.255.255", port));
         // Some switches drop broadcast but pass multicast.
@@ -737,7 +767,9 @@ fn prepare_epoch(node: &Arc<Node>, epoch: u64) -> bool {
     };
 
     let weights = node.weights();
-    let plan = blueprint::assign(&bp, &weights, REPLICAS, &node.capacity_mb());
+    let capacity = node.capacity_mb();
+    let copies = replicas_for(&bp, weights.len(), &capacity);
+    let plan = blueprint::assign(&bp, &weights, copies, &capacity);
     // The web tier serves a real file tree, so a node needs every chunk once,
     // while it builds that tree. Ownership then decides what it keeps and who
     // repairs it, which is what the plan is used for in `repair_loop`.
@@ -962,6 +994,253 @@ pub fn restore_from(file: &str) -> Result<i32, String> {
     Ok(0)
 }
 
+/// Where a rebuild may pull from: the address given, else every box the network
+/// map names, else every box in the last fleet state.
+fn heal_sources(from: Option<&str>) -> Result<Vec<(Ipv4Addr, u16)>, String> {
+    let mut out: Vec<(Ipv4Addr, u16)> = Vec::new();
+    if let Some(text) = from {
+        for part in text.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (ip, port) = match part.rsplit_once(':') {
+                Some((ip, port)) => (ip, port.parse::<u16>().unwrap_or(CONTROL)),
+                None => (part, CONTROL),
+            };
+            let ip: Ipv4Addr = ip
+                .parse()
+                .map_err(|_| format!("{:?} is not an IPv4 address", ip))?;
+            out.push((ip, port));
+        }
+        return Ok(out);
+    }
+    if let Ok(text) = fs::read_to_string(netmap_path()) {
+        if let Some(map) = crate::netmap::parse(&text) {
+            for b in &map.boxes {
+                if let Ok(ip) = b.ip.parse::<Ipv4Addr>() {
+                    out.push((ip, CONTROL));
+                }
+            }
+        }
+    }
+    if let Ok(text) = fs::read_to_string(state_file()) {
+        if let Ok(value) = crate::json::parse(text.trim()) {
+            if let Some(peers) = value.get("peers").and_then(|p| p.as_arr()) {
+                for peer in peers {
+                    if let Some(crate::json::Value::Str(ip)) = peer.get("ip") {
+                        if let Ok(ip) = ip.parse::<Ipv4Addr>() {
+                            out.push((ip, CONTROL));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    // Never dial this box: it is the one asking.
+    let own = sys::lan_ip();
+    out.retain(|(ip, _)| *ip != Ipv4Addr::LOCALHOST && ip.to_string() != own);
+    Ok(out)
+}
+
+/// Rebuild this box from one working server.
+///
+/// Every node fetches every chunk before it serves an epoch, so any surviving
+/// node is a complete copy of the release. That makes this the guarantee worth
+/// keeping: with one box left, a blank machine can be brought back over the
+/// network alone -- no stick, no archive, no second copy, no controller. It is
+/// also the manual repair path for a box that never goes quiet enough for the
+/// background loop.
+pub fn heal(from: Option<&str>) -> Result<i32, String> {
+    let key = auth::fleet_key();
+    let sources = heal_sources(from)?;
+    if sources.is_empty() {
+        return Err("no working server to rebuild from (pass --from IP)".into());
+    }
+    let store = Store::at(store_root());
+    let mut picked: Option<(Ipv4Addr, u16, Blueprint)> = None;
+    let mut last_error = String::new();
+    for (ip, port) in &sources {
+        match fetch_bytes(*ip, *port, key.as_ref(), "BLUEPRINT") {
+            Some(bytes) => match Blueprint::parse(&String::from_utf8_lossy(&bytes)) {
+                Some(bp) => {
+                    picked = Some((*ip, *port, bp));
+                    break;
+                }
+                None => last_error = format!("{}:{} sent a blueprint that does not parse", ip, port),
+            },
+            None => last_error = format!("{}:{} did not answer", ip, port),
+        }
+    }
+    let (ip, port, bp) = picked
+        .ok_or_else(|| format!("no server gave me a blueprint ({})", last_error))?;
+    println!("rebuilding epoch {} from {}:{}", bp.epoch, ip, port);
+
+    let mut fetched = 0usize;
+    let mut already = 0usize;
+    for chunk in &bp.chunks {
+        if store.has(&chunk.hash) {
+            already += 1;
+            continue;
+        }
+        let bytes = fetch_bytes(ip, port, key.as_ref(), &format!("CHUNK {}", chunk.hash))
+            .ok_or_else(|| format!("{}:{} did not send chunk {}", ip, port, chunk.hash))?;
+        // Never trust the wire: the hash is the name.
+        if hash::bytes(&bytes) != chunk.hash {
+            return Err(format!(
+                "chunk {} arrived corrupted from {}:{}",
+                chunk.hash, ip, port
+            ));
+        }
+        store
+            .put(&bytes)
+            .map_err(|e| format!("cannot store {}: {}", chunk.hash, e))?;
+        fetched += 1;
+    }
+
+    persist_blueprint(&store, &releases_root(), &bp)
+        .map_err(|e| format!("cannot write the blueprint: {}", e))?;
+    materialize(&bp, &store, bp.epoch)
+        .map_err(|e| format!("cannot lay out epoch {}: {}", bp.epoch, e))?;
+    let dir = releases_root().join(bp.epoch.to_string());
+    hand_to_cluster(&dir);
+    let live = live_path();
+    let tmp = releases_root().join(".live-heal");
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(&dir, &tmp)
+        .map_err(|e| format!("cannot link {}: {}", dir.display(), e))?;
+    if let Err(e) = fs::rename(&tmp, &live) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("cannot switch {}: {}", live.display(), e));
+    }
+    // Only the real layout has a /run/cartridge to re-stage and a screen to
+    // repaint; a sandbox pointed elsewhere must not touch either.
+    if std::env::var("CARTRIDGE_LIVE").is_err() && std::env::var("CARTRIDGE_RELEASES").is_err() {
+        if let Err(e) = publish::run() {
+            log("warn", &format!("publish after heal failed: {}", e));
+        }
+        apply_boot_art(&dir);
+    }
+    println!(
+        "rebuilt epoch {}: {} file(s), {} chunk(s) fetched, {} already here, {}",
+        bp.epoch,
+        bp.files.len(),
+        fetched,
+        already,
+        sys::human(bp.bytes())
+    );
+    println!("live: {} -> {}", live.display(), dir.display());
+    Ok(0)
+}
+
+/// Check the redundancy the fleet promises: every chunk of the live release on
+/// at least `REPLICAS` live boxes. It walks the whole release and asks every box
+/// the map knows, so it is slow on purpose -- it is a check, not a serving path.
+pub fn verify() -> Result<i32, String> {
+    let store = Store::at(store_root());
+    let bp = fs::read_to_string(store.root().join("blueprint"))
+        .ok()
+        .and_then(|text| Blueprint::parse(&text))
+        .ok_or("no blueprint in the store yet")?;
+    let key = auth::fleet_key();
+    let me = ident::load_or_create();
+
+    let mut boxes: Vec<(String, TcpStream)> = Vec::new();
+    for (ip, port) in heal_sources(None)? {
+        let mut stream = match connect(ip, port, key.as_ref()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let name = if stream.write_all(b"INFO\n").is_ok() {
+            read_line(&mut stream)
+                .ok()
+                .and_then(|line| crate::json::parse(line.trim()).ok())
+                .and_then(|v| match v.get("name") {
+                    Some(crate::json::Value::Str(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| ip.to_string())
+        } else {
+            ip.to_string()
+        };
+        boxes.push((name, stream));
+    }
+
+    let mut counts = vec![0usize; bp.chunks.len()];
+    let mut local = 0usize;
+    for (i, chunk) in bp.chunks.iter().enumerate() {
+        if store.has(&chunk.hash) {
+            counts[i] += 1;
+            local += 1;
+        }
+    }
+    println!(
+        "  {:<20} {:>7} of {} chunk(s)",
+        format!("{} (self)", me.name),
+        local,
+        bp.chunks.len()
+    );
+    for (name, stream) in boxes.iter_mut() {
+        let mut has = 0usize;
+        for (i, chunk) in bp.chunks.iter().enumerate() {
+            if stream
+                .write_all(format!("HAVE {}\n", chunk.hash).as_bytes())
+                .is_err()
+            {
+                break;
+            }
+            if let Ok(reply) = read_line(stream) {
+                if reply == "YES" {
+                    counts[i] += 1;
+                    has += 1;
+                }
+            }
+        }
+        println!("  {:<20} {:>7} of {} chunk(s)", name, has, bp.chunks.len());
+    }
+
+    let mut lost = 0usize;
+    let mut thin = 0usize;
+    let mut histogram: BTreeMap<usize, usize> = BTreeMap::new();
+    for n in &counts {
+        *histogram.entry(*n).or_insert(0) += 1;
+        if *n == 0 {
+            lost += 1;
+        }
+        if *n < REPLICAS {
+            thin += 1;
+        }
+    }
+    let copies: Vec<String> = histogram
+        .iter()
+        .map(|(n, c)| format!("{} cop{}: {} chunk(s)", n, if *n == 1 { "y" } else { "ies" }, c))
+        .collect();
+    println!(
+        "epoch {}: {} chunk(s) -- {}",
+        bp.epoch,
+        bp.chunks.len(),
+        copies.join(", ")
+    );
+    if lost > 0 {
+        println!(
+            "{} chunk(s) are on no reachable box: rebuild from an archive, then run `fleet heal` on the other boxes",
+            lost
+        );
+        return Ok(1);
+    }
+    if thin > 0 {
+        println!(
+            "{} chunk(s) are below the {} copy floor; the repair loop copies them back when a box is idle",
+            thin, REPLICAS
+        );
+    } else {
+        println!("every chunk is on at least {} box(es)", REPLICAS);
+    }
+    Ok(0)
+}
+
 fn activate(node: &Arc<Node>, epoch: u64) {
     let dir = releases_root().join(epoch.to_string());
     if !dir.is_dir() {
@@ -1053,9 +1332,9 @@ fn repair_loop(node: Arc<Node>) {
     loop {
         std::thread::sleep(REPAIR_EVERY);
         // A repair fetches and re-hashes chunks, so it is the one loop here that
-        // can move megabytes of disk and CPU. It waits for the box to be idle,
-        // like the archive does, so a busy node never repairs instead of serving.
-        if node.busy.load(Ordering::Relaxed) > 0 || pressure() > 1.0 {
+        // can move megabytes of disk and CPU. It waits until serving has the CPU
+        // to itself: a busy node never repairs instead of answering users.
+        if !idle_for_background() {
             continue;
         }
         let bp = {
@@ -1100,7 +1379,7 @@ fn archive_loop(node: Arc<Node>) {
     loop {
         std::thread::sleep(Duration::from_secs(60));
         // Idle work only: never compete with serving.
-        if node.busy.load(Ordering::Relaxed) > 0 || pressure() > 1.0 {
+        if !idle_for_background() {
             continue;
         }
         let bp = {
@@ -1129,6 +1408,71 @@ fn archive_loop(node: Arc<Node>) {
             Err(e) => log("warn", &format!("archive failed: {}", e)),
         }
     }
+}
+
+/// Clock ticks per second, for turning `/proc/<pid>/stat` into seconds.
+fn clock_ticks() -> f64 {
+    unsafe {
+        let v = sysconf(2); // _SC_CLK_TCK
+        if v > 0 {
+            v as f64
+        } else {
+            100.0
+        }
+    }
+}
+
+/// `utime + stime` of one process, in clock ticks.
+fn cpu_ticks(pid: i32) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // The command name is in parentheses and may itself contain spaces, so the
+    // fields are counted from the last `)` rather than from the start.
+    let rest = &text[text.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// How much of one core the web server used since the last look: 0.0 when it is
+/// idle, 1.0 when it is saturating a core.
+///
+/// This is the only honest measure of "the box is serving right now", and the
+/// fleet's background loops are allowed to run only when it is near zero. The
+/// first call reports 1.0 so nothing starts before there is a sample to judge
+/// by; a call too soon after the last one reuses that sample's answer instead of
+/// dividing by a near-zero interval.
+fn serving_busy() -> f64 {
+    static LAST: Mutex<Option<(u64, Instant, f64)>> = Mutex::new(None);
+    let pid = match sys::read_trim("/run/cartridge-web.pid").and_then(|p| p.parse::<i32>().ok()) {
+        Some(pid) => pid,
+        None => return 0.0,
+    };
+    let now = Instant::now();
+    let ticks = match cpu_ticks(pid) {
+        Some(t) => t,
+        None => return 0.0,
+    };
+    let mut last = LAST.lock().unwrap();
+    let busy = match *last {
+        Some((before, at, rate)) => {
+            let secs = now.duration_since(at).as_secs_f64();
+            if secs < 0.05 {
+                return rate;
+            }
+            (ticks.saturating_sub(before) as f64 / clock_ticks()) / secs
+        }
+        None => 1.0,
+    };
+    *last = Some((ticks, now, busy));
+    busy
+}
+
+/// True when serving has the CPU to itself, which is the only time repair and
+/// archive work may run. Users always come first; these tasks can wait, and
+/// `fleet heal` is the manual override for a box that never goes quiet.
+fn idle_for_background() -> bool {
+    serving_busy() < 0.25 && pressure() <= 1.0
 }
 
 /// `/proc/pressure/cpu`'s `some avg10`, or 0 when the kernel has no PSI.
@@ -1709,6 +2053,22 @@ pub fn status() -> Result<i32, String> {
         sys::human(show("bytes").parse().unwrap_or(0))
     );
     println!("  {} rps, {}/s", show("rps"), sys::human(show("bps").parse().unwrap_or(0)));
+    // How much of the release this box could rebuild the fleet from on its own.
+    let store = Store::at(store_root());
+    if let Some(bp) = fs::read_to_string(store.root().join("blueprint"))
+        .ok()
+        .and_then(|text| Blueprint::parse(&text))
+    {
+        let held = bp.chunks.iter().filter(|c| store.has(&c.hash)).count();
+        let total = bp.chunks.len();
+        println!(
+            "  {}/{} chunk(s) on this box{}  ·  target {} copies",
+            held,
+            total,
+            if held == total { " (the whole release)" } else { "" },
+            show("replicas")
+        );
+    }
     if let Some(peers) = value.get("peers").and_then(|p| p.as_arr()) {
         if peers.is_empty() {
             println!("  alone: this box is the whole cluster");
@@ -2039,5 +2399,76 @@ mod tests {
             assert!(fresh.has(&piece.hash), "{} missing after restore", piece.hash);
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spare_space_buys_more_copies() {
+        let bp = Blueprint {
+            epoch: 1,
+            root: "x".into(),
+            files: Vec::new(),
+            chunks: vec![blueprint::Piece {
+                hash: format!("{:064x}", 1),
+                len: 100 * 1024 * 1024,
+            }],
+        };
+        // One box: one copy, whatever the space.
+        let mut one = BTreeMap::new();
+        one.insert(1u64, 100_000u64);
+        assert_eq!(replicas_for(&bp, 1, &one), 1);
+        // Three boxes with room for one copy each: three copies.
+        let mut three = BTreeMap::new();
+        three.insert(1u64, 100u64);
+        three.insert(2u64, 100);
+        three.insert(3u64, 100);
+        assert_eq!(replicas_for(&bp, 3, &three), 3);
+        // Three boxes with room for one copy between them: the floor of two.
+        let mut tight = BTreeMap::new();
+        tight.insert(1u64, 50u64);
+        tight.insert(2u64, 50);
+        tight.insert(3u64, 10);
+        assert_eq!(replicas_for(&bp, 3, &tight), 2);
+        // Space for five copies on five boxes: all five.
+        let mut wide = BTreeMap::new();
+        for k in 1..=5u64 {
+            wide.insert(k, 1_000);
+        }
+        assert_eq!(replicas_for(&bp, 5, &wide), 5);
+    }
+
+    #[test]
+    fn the_plan_uses_every_box_when_space_allows() {
+        let bp = Blueprint {
+            epoch: 2,
+            root: "y".into(),
+            files: Vec::new(),
+            chunks: (1..=4u64)
+                .map(|i| blueprint::Piece {
+                    hash: format!("{:064x}", i),
+                    len: 8 * 1024 * 1024,
+                })
+                .collect(),
+        };
+        let members = [(100u32, 1u64), (100, 2), (100, 3)];
+        let mut cap = BTreeMap::new();
+        for (_, key) in members {
+            cap.insert(key, 100_000u64);
+        }
+        let copies = replicas_for(&bp, members.len(), &cap);
+        assert_eq!(copies, 3);
+        let plan = blueprint::assign(&bp, &members, copies, &cap);
+        assert_eq!(plan.len(), bp.chunks.len());
+        for holders in plan.values() {
+            assert_eq!(holders.len(), 3, "every box should hold every chunk");
+        }
+    }
+
+    #[test]
+    fn a_rebuild_address_is_parsed_with_or_without_a_port() {
+        let given = heal_sources(Some("10.0.0.9")).unwrap();
+        assert_eq!(given, vec![(Ipv4Addr::new(10, 0, 0, 9), CONTROL)]);
+        let with_port = heal_sources(Some("10.0.0.9:2999")).unwrap();
+        assert_eq!(with_port, vec![(Ipv4Addr::new(10, 0, 0, 9), 2999)]);
+        assert!(heal_sources(Some("not-an-ip")).is_err());
     }
 }

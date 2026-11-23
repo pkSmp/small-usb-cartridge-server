@@ -232,8 +232,10 @@ own 75f218d31266ee36...  5366 2593e760...,8a1f...
   placement weight, GPU presence, RAM, free disk, the chunks it is responsible
   for, and whether that line is this machine.
 - `file` — every file the release carries, with its length and content type.
-- `own` — every chunk, and the ids of the computers that should hold it (two by
-  default). This is what makes the map a storage map and not only a list.
+- `own` — every chunk, and the ids of the computers that should hold it. Two by
+  default, and one more for every full copy the spare disk can take, so a fleet
+  with room for four copies of the release names four boxes. This is what makes
+  the map a storage map and not only a list.
 
 It is rendered from inputs every box already has (the beacons, the blueprint and
 `blueprint::assign`), so all boxes produce byte-identical text — `cmp` between two
@@ -278,6 +280,33 @@ restored with the wrong bytes.
 unzip opens it and nothing has to be decoded. The `.cart` archive remains the
 compressed, solid copy for space; the zip is the one to hand to a person or to
 carry off the box.
+
+### Rebuilding from one box
+
+Every node pulls every chunk before it serves an epoch, so any surviving box is
+a complete copy of the release. That is what makes a full rebuild possible with
+one machine left, and it is kept as a guarantee rather than a hope:
+
+- `cartridge fleet heal [--from IP]` brings a blank box back over the network.
+  It asks a live node for the blueprint, fetches every chunk it is missing
+  (verifying each one by hash as it lands), lays the tree out, switches `live`
+  and re-stages RAM. With no `--from` it tries every box the network map or the
+  last fleet state names. No stick, no archive, no controller, no second copy.
+- `cartridge fleet restore FILE` does the same from one archive, with no network
+  at all.
+- `cartridge fleet archive` and `cartridge fleet zip` write the two files worth
+  carrying off the last box.
+- `cartridge fleet verify` walks the release and asks every box the map knows
+  which chunks it holds, then prints how many copies each chunk has. It says
+  plainly when a chunk is on no reachable box.
+
+Copies are not a fixed two. `replicas_for` starts at two and adds one for every
+full copy the spare disk can take, so spare space is never left idle while it
+could be a backup, and a single box keeps one copy rather than pretending.
+
+Repair, archiving and the rest of the background work wait until the web server
+has used less than a quarter of a core over the last sample. Users always come
+first; `fleet heal` is the manual override for a box that never goes quiet.
 
 ### Boot art across the fleet
 
@@ -501,6 +530,9 @@ loadgen download HOST PORT PATH [CONNS]
 | `cartridge cluster [--root DIR] [--name ID] [--offset N]` | find the boxes on the switch, keep one release between them, split the load; `--offset` mirrors `web --offset` for a second copy on one machine |
 | `cartridge import DEVICE` | ingest a stick |
 | `cartridge publish` | copy the live release into RAM |
+| `cartridge fleet heal [--from IP]` | rebuild this box from one working server |
+| `cartridge fleet verify` | check every chunk still has its copies |
+| `cartridge fleet restore FILE` | rebuild this box from one archive, offline |
 | `cartridge status [--watch]` | machine, stick, staging, sites, URLs |
 | `cartridge sites` | live sites and ports as a Markdown table |
 | `cartridge console` | site table and machine facts under the art |

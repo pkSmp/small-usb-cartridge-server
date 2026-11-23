@@ -55,6 +55,8 @@ fn usage() -> ! {
          \x20 fleet map                        the whole network as plain text\n\
          \x20 fleet zip [FILE]                 every site file as one uncompressed .zip\n\
          \x20 fleet restore FILE               rebuild this box from one archive\n\
+         \x20 fleet heal [--from IP]           rebuild this box from one working server\n\
+         \x20 fleet verify                     check every chunk still has its copies\n\
          \x20 publish                        copy the live release into RAM\n\
          \x20 import DEVICE                  ingest a cartridge\n\
          \x20 status [--watch]               report what the machine sees\n\
@@ -276,6 +278,20 @@ fn run_fleet(args: &[String]) -> Result<i32, String> {
             let file = args.get(1).ok_or("fleet restore needs an archive path")?;
             return fleet::restore_from(file);
         }
+        Some("heal") => {
+            let mut from: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--from" {
+                    from = args.get(i + 1).cloned();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            return fleet::heal(from.as_deref());
+        }
+        Some("verify") => return fleet::verify(),
         Some("key") => {
             let created = auth::ensure_key()?;
             if created {
